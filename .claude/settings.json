@@ -1,0 +1,56 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "allow": [
+      "Bash(go build *)",
+      "Bash(go test *)",
+      "Bash(go vet *)",
+      "Bash(go list *)",
+      "Bash(gofmt *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git branch)",
+      "Bash(git branch --list*)"
+    ],
+    "ask": [
+      "Bash(git commit *)",
+      "Bash(git checkout *)",
+      "Bash(git switch *)",
+      "Bash(go mod *)",
+      "Bash(go get *)",
+      "Bash(go install *)",
+      "Bash(codex *)"
+    ],
+    "deny": [
+      "Bash(git push*)",
+      "Bash(git reset --hard*)",
+      "Bash(git rebase*)",
+      "Bash(sudo *)",
+      "Bash(rm -rf *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(pnpm *)",
+      "Bash(yarn *)",
+      "Bash(az *)",
+      "Bash(pwsh *)",
+      "Bash(ssh *)",
+      "Bash(tailscale *)",
+      "WebFetch",
+      "Read(./.env*)",
+      "Read(~/.ssh/**)",
+      "Read(~/.azure/**)",
+      "Read(~/.codex/**)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)"
+    ]
+  },
+  "env": {
+    "GOPROXY": "off",
+    "GOTOOLCHAIN": "local",
+    "GOFLAGS": "-mod=readonly"
+  }
+}
