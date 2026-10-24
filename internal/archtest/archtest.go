@@ -59,6 +59,11 @@ var Rules = []Rule{
 		Reason:    "plans are untrusted proposals and cannot execute or approve",
 	},
 	{
+		Pkg:       "internal/approve",
+		Forbidden: []string{"internal/execute", "internal/plan", "internal/evaluate", "internal/inspect", "internal/entra", "internal/policy", "net", "net/http", "os/exec"},
+		Reason:    "approval only signs and verifies plan hashes; it must not reach tenant state or networks",
+	},
+	{
 		Pkg:       "internal/evaluate",
 		Forbidden: []string{"internal/execute"},
 		Reason:    "evaluation is read-only",
