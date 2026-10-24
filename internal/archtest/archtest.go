@@ -391,13 +391,17 @@ var ConstrainedAllowed = []string{
 
 // SourcePackages walks root and returns one Package per directory holding
 // non-test Go files, with GoFiles listing every such file regardless of
-// build constraints and Imports/Deps set to the files' direct imports.
-// Directories the go tool ignores (testdata, and names starting with "."
-// or "_") are skipped, as is vendor.
+// build constraints, Imports set to the files' direct imports and Deps to
+// the direct imports plus every module package reachable through them.
+//
+// Only directories whose name starts with "." are skipped, because such
+// paths cannot be imported. testdata, vendor and "_" directories are
+// walked: `./...` ignores them, but they can still be imported explicitly.
 //
 // Running the existing checks on these packages covers files that
-// `go list` leaves out. Their transitive dependencies are not known, so
-// for them the boundary rules are only checked one import deep.
+// `go list` leaves out. Deps is computed over all files of every package,
+// regardless of whether they would be built together, so it can only
+// over-approximate the real dependencies (fail closed).
 func SourcePackages(root, module string) ([]Package, error) {
 	byDir := map[string]*Package{}
 	var order []string
@@ -407,7 +411,7 @@ func SourcePackages(root, module string) ([]Package, error) {
 		}
 		name := d.Name()
 		if d.IsDir() {
-			if path != root && (name == "testdata" || name == "vendor" || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")) {
+			if path != root && strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
 			}
 			return nil
@@ -449,14 +453,45 @@ func SourcePackages(root, module string) ([]Package, error) {
 	if err != nil {
 		return nil, err
 	}
+	byPath := map[string]*Package{}
+	for _, p := range byDir {
+		sort.Strings(p.Imports)
+		byPath[p.ImportPath] = p
+	}
 	var out []Package
 	for _, dir := range order {
 		p := byDir[dir]
-		sort.Strings(p.Imports)
-		p.Deps = p.Imports
+		p.Deps = closure(module, p.Imports, byPath)
 		out = append(out, *p)
 	}
 	return out, nil
+}
+
+// closure returns imports plus every module package transitively
+// imported by the module packages among them.
+func closure(module string, imports []string, byPath map[string]*Package) []string {
+	seen := map[string]bool{}
+	var visit func(ip string)
+	visit = func(ip string) {
+		if seen[ip] {
+			return
+		}
+		seen[ip] = true
+		if q, ok := byPath[ip]; ok && within(ip, module) {
+			for _, next := range q.Imports {
+				visit(next)
+			}
+		}
+	}
+	for _, ip := range imports {
+		visit(ip)
+	}
+	out := make([]string, 0, len(seen))
+	for ip := range seen {
+		out = append(out, ip)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // HasBuildTag reports whether the file has a //go:build or // +build line

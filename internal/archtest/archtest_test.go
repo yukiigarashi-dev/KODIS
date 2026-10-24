@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -202,7 +203,9 @@ func TestRepository(t *testing.T) {
 	root := goOutput(t, "list", "-m", "-f", "{{.Dir}}")
 	module := goOutput(t, "list", "-m")
 
-	cmd := exec.Command("go", "list", "-json", "./...")
+	// -deps also lists module packages imported from outside ./... (for
+	// example from an "_" or testdata directory).
+	cmd := exec.Command("go", "list", "-deps", "-json", "./...")
 	cmd.Dir = root
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -333,14 +336,19 @@ func writeFiles(t *testing.T, files map[string]string) string {
 }
 
 func TestSourcePackagesIncludesExcludedFiles(t *testing.T) {
+	bypass := "package bridge\n\nimport \"" + mod + "/internal/mockentra\"\n\nfunc f(t *mockentra.Tenant) { t.Writer().SetConditionalAccessState() }\n"
 	root := writeFiles(t, map[string]string{
 		"cmd/kodis/main.go":            "package main\n",
 		"cmd/kodis/zz_bypass.go":       "//go:build bypass\n\npackage main\n\nimport \"" + mod + "/internal/mockentra\"\n\nfunc f(t *mockentra.Tenant) { t.Writer().SetConditionalAccessState() }\n",
 		"cmd/kodis/main_test.go":       "package main\nimport \"" + mod + "/internal/mockentra\"\n",
 		"internal/verify/v_windows.go": "package verify\nimport \"" + mod + "/internal/mockentra\"\n",
 		"internal/only/x.go":           "//go:build never\n\npackage only\nimport \"example.com/thirdparty\"\n",
-		"testdata/ignored/x.go":        "package ignored\nimport \"example.com/thirdparty\"\n",
-		".hidden/x.go":                 "package hidden\nimport \"example.com/thirdparty\"\n",
+		// Review 3 finding 2: ./... skips these, but they can be imported.
+		"_bridge/b.go":                  bypass,
+		"internal/testdata/bridge/b.go": bypass,
+		"vendor/v/v.go":                 "package v\nimport \"example.com/thirdparty\"\n",
+		// Dot directories cannot be imported and are skipped.
+		".hidden/x.go": "package hidden\nimport \"example.com/thirdparty\"\n",
 	})
 	src, err := SourcePackages(root, mod)
 	if err != nil {
@@ -350,8 +358,10 @@ func TestSourcePackagesIncludesExcludedFiles(t *testing.T) {
 	for _, p := range src {
 		paths = append(paths, p.ImportPath)
 	}
-	if got := strings.Join(paths, ","); got != mod+"/cmd/kodis,"+mod+"/internal/only,"+mod+"/internal/verify" {
-		t.Fatalf("packages %s", got)
+	slices.Sort(paths)
+	want := []string{mod + "/_bridge", mod + "/cmd/kodis", mod + "/internal/only", mod + "/internal/testdata/bridge", mod + "/internal/verify", mod + "/vendor/v"}
+	if !slices.Equal(paths, want) {
+		t.Fatalf("packages %v, want %v", paths, want)
 	}
 	for _, p := range src {
 		if p.ImportPath == mod+"/cmd/kodis" && strings.Join(p.GoFiles, ",") != "main.go,zz_bypass.go" {
@@ -359,19 +369,60 @@ func TestSourcePackagesIncludesExcludedFiles(t *testing.T) {
 		}
 	}
 	calls, err := CheckWriteCalls(mod, src, []string{"SetConditionalAccessState"}, WriterAllowed)
-	if err != nil || len(calls) != 1 {
-		t.Fatalf("write calls in tagged file: %v %v", calls, err)
+	if err != nil || len(calls) != 3 {
+		t.Fatalf("write calls (tagged file, _bridge, testdata): %v %v", calls, err)
 	}
-	if got := CheckImporters(mod, src, ImportRules); len(got) != 1 || !strings.Contains(got[0], "internal/verify") {
-		t.Fatalf("mock import from a windows-only file: %v", got)
+	if got := CheckImporters(mod, src, ImportRules); len(got) != 3 {
+		t.Fatalf("mock imports from windows-only, _bridge and testdata packages: %v", got)
 	}
-	if got := CheckStdlibOnly(mod, src); len(got) != 1 || !strings.Contains(got[0], "internal/only") {
-		t.Fatalf("third-party import from a never-built package: %v", got)
+	if got := CheckStdlibOnly(mod, src); len(got) != 2 {
+		t.Fatalf("third-party imports from never-built and vendor packages: %v", got)
 	}
 	oses, arches := platforms(t)
 	cf, err := CheckConstrainedFiles(root, src, nil, oses, arches)
 	if err != nil || len(cf) != 3 {
 		t.Fatalf("constrained files: %v %v", cf, err)
+	}
+}
+
+// Review 3 finding 3: a dependency reached only through a build-
+// constrained file is checked transitively, not just one import deep.
+func TestSourcePackagesTransitiveThroughConstrainedFile(t *testing.T) {
+	root := writeFiles(t, map[string]string{
+		"internal/approve/owner_unix.go":  "//go:build unix\n\npackage approve\n",
+		"internal/approve/owner_other.go": "//go:build !unix\n\npackage approve\n\nimport \"" + mod + "/internal/bridge\"\n\nvar b = bridge.Build\n",
+		"internal/bridge/bridge.go":       "package bridge\n\nimport \"" + mod + "/internal/plan\"\n\nvar Build = plan.Build\n",
+		"internal/plan/plan.go":           "package plan\n\nimport \"" + mod + "/internal/model\"\n\nvar Build = model.X\n",
+		"internal/model/model.go":         "package model\n\nvar X = 1\n",
+	})
+	src, err := SourcePackages(root, mod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range src {
+		if p.ImportPath == mod+"/internal/approve" {
+			if !slices.Contains(p.Deps, mod+"/internal/plan") || !slices.Contains(p.Deps, mod+"/internal/model") {
+				t.Fatalf("approve deps %v lack the transitive plan/model", p.Deps)
+			}
+			if slices.Contains(p.Imports, mod+"/internal/plan") {
+				t.Fatal("Imports must stay direct")
+			}
+		}
+	}
+	got := CheckBoundaries(mod, src, Rules)
+	if len(got) != 1 || !strings.Contains(got[0], "internal/approve depends on "+mod+"/internal/plan") {
+		t.Fatalf("approve -> bridge -> plan not reported: %v", got)
+	}
+}
+
+func TestClosureHandlesCycles(t *testing.T) {
+	byPath := map[string]*Package{
+		mod + "/a": {ImportPath: mod + "/a", Imports: []string{mod + "/b"}},
+		mod + "/b": {ImportPath: mod + "/b", Imports: []string{mod + "/a", "fmt"}},
+	}
+	got := closure(mod, []string{mod + "/a"}, byPath)
+	if strings.Join(got, ",") != mod+"/a,"+mod+"/b,fmt" {
+		t.Fatalf("closure %v", got)
 	}
 }
 
