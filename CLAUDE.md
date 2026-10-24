@@ -22,6 +22,7 @@ Key-scoped Operations & Deterministic Inspection System。
 4. 承認は特定の Plan ハッシュに束縛する。Plan が1バイトでも変われば無効にする。
 5. Verify は Executor の戻り値を使わず、別の Reader で状態を取り直して比較する。
 6. 拒否を含むすべての判定を audit に記録する。
+7. 監査ログは `audit-init` で明示的に作る。実行時には外部に保管したチェックポイントを必須とし、一致しなければ止める。ログの初期化・復旧より前に発行された承認は実行しない。限界は docs/audit-checkpoint.md に書いたとおりで、それ以上を保証すると主張しない。
 
 ## パッケージ境界
 - `entra.Writer` を参照してよいのは `internal/execute` と `internal/mockentra` だけ。

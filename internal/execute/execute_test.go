@@ -87,6 +87,8 @@ func setup(t *testing.T) *env {
 			Writer:   tn.Writer(),
 			Ledger:   &MemoryLedger{},
 			Now:      c.Now,
+			// The ledger "started" an hour before the test approvals.
+			ApprovalsNotBefore: t0.Add(-time.Hour),
 		},
 	}
 }
@@ -155,6 +157,25 @@ func TestHappyPath(t *testing.T) {
 	}
 	if len(e.tenant.Writes()) != 1 {
 		t.Fatalf("writes %+v", e.tenant.Writes())
+	}
+}
+
+// An approval issued before the ledger's last init/recovery is refused
+// even though it is otherwise valid: its claim may have been lost.
+func TestApprovalBeforeLedgerRecoveryIsRefused(t *testing.T) {
+	e := setup(t)
+	p := plan()
+	a := e.approve(t, p) // issued at t0
+	e.cfg.ApprovalsNotBefore = t0.Add(time.Second)
+	r := e.executor(t).Execute(context.Background(), p, a)
+	if r.Status != StatusDenied || !strings.Contains(strings.Join(r.Reasons, "\n"), "before the ledger") || len(e.tenant.Writes()) != 0 {
+		t.Fatalf("status %s reasons %v writes %d", r.Status, r.Reasons, len(e.tenant.Writes()))
+	}
+	// Issued exactly at the recovery instant: allowed.
+	e2 := setup(t)
+	e2.cfg.ApprovalsNotBefore = t0
+	if r := e2.executor(t).Execute(context.Background(), p, e2.approve(t, p)); r.Status != StatusCompleted {
+		t.Fatalf("boundary: %s %v", r.Status, r.Reasons)
 	}
 }
 
@@ -531,11 +552,12 @@ func TestDroppedWriteIsNotDetectedHere(t *testing.T) {
 func TestNewRequiresAllDependencies(t *testing.T) {
 	e := setup(t)
 	for name, mutate := range map[string]func(*Config){
-		"verifier": func(c *Config) { c.Verifier = nil },
-		"reader":   func(c *Config) { c.Reader = nil },
-		"writer":   func(c *Config) { c.Writer = nil },
-		"ledger":   func(c *Config) { c.Ledger = nil },
-		"clock":    func(c *Config) { c.Now = nil },
+		"verifier":  func(c *Config) { c.Verifier = nil },
+		"reader":    func(c *Config) { c.Reader = nil },
+		"writer":    func(c *Config) { c.Writer = nil },
+		"ledger":    func(c *Config) { c.Ledger = nil },
+		"clock":     func(c *Config) { c.Now = nil },
+		"notBefore": func(c *Config) { c.ApprovalsNotBefore = time.Time{} },
 	} {
 		c := e.cfg
 		mutate(&c)

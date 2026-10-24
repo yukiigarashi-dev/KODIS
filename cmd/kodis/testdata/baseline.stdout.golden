@@ -1,3 +1,4 @@
+audit: checkpoint seq 1 verified; approvals issued before 2026-10-25T09:00:00Z are refused
 inspect: 3 conditional access policies in tenant-contoso.example.test
 evaluate: 1 findings
   [high] ca.mfa-policy-disabled Conditional Access policy ca-require-mfa-admins requires MFA but is disabled
@@ -9,4 +10,5 @@ approval: signed by alice, expires 2026-10-25T09:15:00Z
 execute: completed
   action-0001: written 
 verify: verified=true
-audit head: sha256:6ede7392f89acb9c06d3f6202c7adbadfbd7ea7a85560c47a2f46620a3463203
+checkpoint: kodis-ckpt/v1:58c54171a8bd063d03eeaa9f06cbd33eaa808558adcac2208c6048ad6bcc30ca:10:c6d38006aaf9a4b464f6ed40446fe47c775daa699a41607d1a80087182e23617
+(keep this checkpoint outside the audit log's storage; the next run requires it)

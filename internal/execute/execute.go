@@ -105,6 +105,11 @@ type Config struct {
 	Writer   entra.Writer
 	Ledger   Ledger
 	Now      func() time.Time
+	// ApprovalsNotBefore rejects approvals issued before it. Callers set it
+	// to the ledger's last init or recovery time: claims made under
+	// earlier approvals may be missing from the ledger, so those approvals
+	// could otherwise be replayed. Required.
+	ApprovalsNotBefore time.Time
 }
 
 // Executor applies approved plans.
@@ -125,6 +130,8 @@ func New(cfg Config) (*Executor, error) {
 		return nil, errors.New("execute: ledger is required")
 	case cfg.Now == nil:
 		return nil, errors.New("execute: clock is required")
+	case cfg.ApprovalsNotBefore.IsZero():
+		return nil, errors.New("execute: ApprovalsNotBefore is required")
 	}
 	return &Executor{cfg: cfg}, nil
 }
@@ -168,6 +175,9 @@ func (e *Executor) Execute(ctx context.Context, p model.Plan, a model.Approval) 
 
 	if err := e.cfg.Verifier.Verify(a, p, e.cfg.Now()); err != nil {
 		return denied(r, "approval: %v", err)
+	}
+	if nb := e.cfg.ApprovalsNotBefore; nb.IsZero() || a.Statement.IssuedAt.Before(nb) {
+		return denied(r, "approval: issued at %s, before the ledger's last init/recovery at %s", a.Statement.IssuedAt, nb.UTC())
 	}
 	for _, act := range p.Actions {
 		if err := checkBuiltin(act); err != nil {

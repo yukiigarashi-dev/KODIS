@@ -14,12 +14,14 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,9 +46,15 @@ const (
 	KindClaim    Kind = "claim"
 	KindExecute  Kind = "execute"
 	KindVerify   Kind = "verify"
+	// KindInit is always and only the first record. Its hash is the log ID.
+	KindInit Kind = "init"
+	// KindRecover marks an explicit recovery after a lost checkpoint.
+	KindRecover Kind = "recover"
+	// KindCheckpoint records the outcome of checking an external checkpoint.
+	KindCheckpoint Kind = "checkpoint"
 )
 
-var kinds = []Kind{KindInspect, KindEvaluate, KindPlan, KindPolicy, KindApproval, KindClaim, KindExecute, KindVerify}
+var kinds = []Kind{KindInspect, KindEvaluate, KindPlan, KindPolicy, KindApproval, KindClaim, KindExecute, KindVerify, KindInit, KindRecover, KindCheckpoint}
 
 // Entry is the hashed part of a record. Field order is part of the hash.
 type Entry struct {
@@ -116,6 +124,9 @@ func Chain(r io.Reader) ([]Record, error) {
 		if err := rec.validate(); err != nil {
 			return nil, fmt.Errorf("audit: line %d: %w", line, err)
 		}
+		if (line == 1) != (rec.Kind == KindInit) {
+			return nil, fmt.Errorf("audit: line %d: an init record must be first and only first", line)
+		}
 		if rec.Seq != uint64(line) {
 			return nil, fmt.Errorf("audit: line %d: seq %d, want %d", line, rec.Seq, line)
 		}
@@ -162,23 +173,34 @@ func readLine(br *bufio.Reader) ([]byte, error) {
 
 // Log is an open audit log.
 type Log struct {
-	mu      sync.Mutex
-	f       *os.File
-	now     func() time.Time
-	seq     uint64
-	head    model.Digest
-	claimed map[model.Digest]bool
-	closed  bool
+	mu        sync.Mutex
+	f         *os.File
+	now       func() time.Time
+	seq       uint64
+	head      model.Digest
+	hashes    []model.Digest // hashes[i] is the hash of record seq i+1
+	logID     model.Digest
+	tenantID  string
+	notBefore time.Time
+	claimed   map[model.Digest]bool
+	closed    bool
 }
 
-// Open opens or creates the log at path (mode 0600), verifies the entire
-// existing chain and takes an exclusive lock. A broken chain is an error;
-// nothing is appended to a log that does not verify.
-func Open(path string, now func() time.Time) (*Log, error) {
-	if now == nil {
-		return nil, errors.New("audit: clock is required")
-	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+// ErrNotInitialized means the log file is missing or empty. Logs are only
+// created by Init, never implicitly.
+var ErrNotInitialized = errors.New("audit: log is not initialized (create it explicitly with Init / kodis audit-init)")
+
+type initData struct {
+	TenantID string `json:"tenantId"`
+	Nonce    string `json:"nonce"`
+}
+
+const nonceBytes = 32
+
+// openFile opens path with flags, checks it is a regular file not
+// writable by group/other, and takes an exclusive lock.
+func openFile(path string, flags int) (*os.File, error) {
+	f, err := os.OpenFile(path, flags, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -195,25 +217,146 @@ func Open(path string, now func() time.Time) (*Log, error) {
 		f.Close()
 		return nil, fmt.Errorf("audit: %s: %w", path, err)
 	}
+	return f, nil
+}
+
+// Open opens an existing, initialized log, verifies the entire chain and
+// takes an exclusive lock. It never creates a log: a missing or empty file
+// is ErrNotInitialized. A broken chain is an error; nothing is appended
+// to a log that does not verify.
+//
+// Verifying the chain does not detect removal of trailing records; check
+// an external checkpoint with VerifyCheckpoint for that.
+func Open(path string, now func() time.Time) (*Log, error) {
+	if now == nil {
+		return nil, errors.New("audit: clock is required")
+	}
+	f, err := openFile(path, os.O_RDWR|os.O_APPEND)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%s: %w", path, ErrNotInitialized)
+	}
+	if err != nil {
+		return nil, err
+	}
 	recs, err := Chain(f)
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	if len(recs) == 0 {
+		f.Close()
+		return nil, fmt.Errorf("%s: %w", path, ErrNotInitialized)
+	}
 	l := &Log{f: f, now: now, claimed: map[model.Digest]bool{}}
+	if err := l.load(recs); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return l, nil
+}
+
+// Summary is what a verified chain says about itself.
+type Summary struct {
+	LogID      model.Digest
+	TenantID   string
+	NotBefore  time.Time
+	Checkpoint Checkpoint
+	hashes     []model.Digest
+	claimed    map[model.Digest]bool
+}
+
+// Summarize validates the init record of a chain returned by Chain and
+// summarizes it. It does not touch any file.
+func Summarize(recs []Record) (Summary, error) {
+	if len(recs) == 0 {
+		return Summary{}, ErrNotInitialized
+	}
+	var d initData
+	if err := model.DecodeStrict(recs[0].Data, MaxRecordBytes, &d); err != nil {
+		return Summary{}, fmt.Errorf("init record: %w", err)
+	}
+	if err := d.validate(); err != nil {
+		return Summary{}, fmt.Errorf("init record: %w", err)
+	}
+	sum := Summary{LogID: recs[0].Hash, TenantID: d.TenantID, claimed: map[model.Digest]bool{}}
 	for _, r := range recs {
-		if r.Kind == KindClaim {
-			d, err := model.ParseDigest(r.PlanHash)
+		switch r.Kind {
+		case KindClaim:
+			h, err := model.ParseDigest(r.PlanHash)
 			if err != nil {
-				f.Close()
-				return nil, fmt.Errorf("%s: claim record %d: %w", path, r.Seq, err)
+				return Summary{}, fmt.Errorf("claim record %d: %w", r.Seq, err)
 			}
-			l.claimed[d] = true
+			sum.claimed[h] = true
+		case KindInit, KindRecover:
+			sum.NotBefore = r.Time
 		}
+		sum.hashes = append(sum.hashes, r.Hash)
 	}
-	if n := len(recs); n > 0 {
-		l.seq, l.head = recs[n-1].Seq, recs[n-1].Hash
+	last := recs[len(recs)-1]
+	sum.Checkpoint = Checkpoint{LogID: sum.LogID, Seq: last.Seq, Head: last.Hash}
+	return sum, nil
+}
+
+// VerifyCheckpoint checks c against the summarized chain; see
+// Log.VerifyCheckpoint.
+func (s Summary) VerifyCheckpoint(c Checkpoint) error {
+	return verifyCheckpoint(s.LogID, s.hashes, c)
+}
+
+func (l *Log) load(recs []Record) error {
+	sum, err := Summarize(recs)
+	if err != nil {
+		return err
 	}
+	l.logID, l.tenantID, l.notBefore = sum.LogID, sum.TenantID, sum.NotBefore
+	l.hashes, l.claimed = sum.hashes, sum.claimed
+	l.seq, l.head = sum.Checkpoint.Seq, sum.Checkpoint.Head
+	return nil
+}
+
+func (d initData) validate() error {
+	if d.TenantID == "" || strings.ContainsAny(d.TenantID, " \t\r\n") {
+		return fmt.Errorf("invalid tenantId %q", d.TenantID)
+	}
+	if len(d.Nonce) != 2*nonceBytes || strings.ToLower(d.Nonce) != d.Nonce {
+		return errors.New("nonce must be lowercase hex")
+	}
+	if _, err := hex.DecodeString(d.Nonce); err != nil {
+		return fmt.Errorf("nonce: %w", err)
+	}
+	return nil
+}
+
+// Init creates a new log at path for one tenant. It refuses to overwrite
+// or reuse an existing file. The init record carries a random nonce so a
+// log re-created with the same tenant and clock still gets a new log ID.
+//
+// Init cannot tell a first-ever log from one re-created after deletion;
+// re-creation is detected only when the operator compares the new log ID
+// with checkpoints they kept.
+func Init(path string, now func() time.Time, rand io.Reader, tenantID string) (*Log, error) {
+	if now == nil || rand == nil {
+		return nil, errors.New("audit: clock and randomness are required")
+	}
+	nonce := make([]byte, nonceBytes)
+	if _, err := io.ReadFull(rand, nonce); err != nil {
+		return nil, fmt.Errorf("audit: nonce: %w", err)
+	}
+	d := initData{TenantID: tenantID, Nonce: hex.EncodeToString(nonce)}
+	if err := d.validate(); err != nil {
+		return nil, fmt.Errorf("audit: %w", err)
+	}
+	f, err := openFile(path, os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_EXCL)
+	if err != nil {
+		return nil, err
+	}
+	l := &Log{f: f, now: now, claimed: map[model.Digest]bool{}}
+	rec, err := l.Append(KindInit, nil, d)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	l.tenantID, l.logID, l.notBefore = tenantID, rec.Hash, rec.Time
 	return l, nil
 }
 
@@ -225,9 +368,13 @@ func (l *Log) Head() model.Digest {
 }
 
 // Append writes one record and syncs it to disk. planHash may be nil.
+// Init and recover records can only be written by Init and Recover.
 func (l *Log) Append(kind Kind, planHash *model.Digest, data any) (Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if kind == KindRecover || (kind == KindInit) != (l.seq == 0) {
+		return Record{}, fmt.Errorf("audit: %q records cannot be appended here", kind)
+	}
 	return l.appendLocked(kind, planHash, data)
 }
 
@@ -269,6 +416,7 @@ func (l *Log) appendLocked(kind Kind, planHash *model.Digest, data any) (Record,
 		return Record{}, fmt.Errorf("audit: sync: %w", err)
 	}
 	l.seq, l.head = e.Seq, h
+	l.hashes = append(l.hashes, h)
 	return rec, nil
 }
 
