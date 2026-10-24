@@ -499,6 +499,22 @@ func (l *Log) Claim(planHash model.Digest, approvalIssuedAt time.Time) error {
 	return nil
 }
 
+// Guard checks approvalIssuedAt against NotBefore and runs fn while
+// holding the log's lock, so Recover cannot interleave with fn and takes
+// effect for the next Guard. fn must not call the log (it would
+// deadlock). It satisfies execute.Ledger.
+func (l *Log) Guard(approvalIssuedAt time.Time, fn func() error) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return errors.New("audit: log is closed")
+	}
+	if approvalIssuedAt.IsZero() || approvalIssuedAt.Before(l.notBefore) {
+		return fmt.Errorf("%w: issued at %s, NotBefore %s", ErrApprovalPredatesLedger, approvalIssuedAt.UTC(), l.notBefore)
+	}
+	return fn()
+}
+
 // Close releases the lock and closes the file.
 func (l *Log) Close() error {
 	l.mu.Lock()

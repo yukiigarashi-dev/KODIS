@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -343,4 +345,87 @@ func kindsOf(recs []Record) string {
 		ks = append(ks, string(r.Kind))
 	}
 	return strings.Join(ks, ",")
+}
+
+// Review 3 finding 1 (ledger side): Recover cannot complete while a
+// guarded write is running, and the next Guard sees it.
+func TestGuardSerializesWithRecover(t *testing.T) {
+	now := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	clk := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	l, err := Init(filepath.Join(t.TempDir(), "a.jsonl"), clk, seeded(1), tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	issued := now.Add(time.Minute)
+	mu.Lock()
+	now = issued.Add(time.Minute)
+	mu.Unlock()
+
+	var recovered atomic.Bool
+	done := make(chan struct{})
+	err = l.Guard(issued, func() error {
+		go func() {
+			defer close(done)
+			if _, err := l.Recover("lost checkpoint"); err != nil {
+				t.Error(err)
+			}
+			recovered.Store(true)
+		}()
+		time.Sleep(50 * time.Millisecond)
+		if recovered.Load() {
+			return errors.New("Recover completed while a guarded write held the lock")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if err := l.Guard(issued, func() error { return nil }); !errors.Is(err, ErrApprovalPredatesLedger) {
+		t.Fatalf("Guard after recovery: %v", err)
+	}
+	if err := l.Guard(time.Time{}, func() error { return nil }); !errors.Is(err, ErrApprovalPredatesLedger) {
+		t.Fatalf("zero approval time: %v", err)
+	}
+	l.Close()
+	if err := l.Guard(now, func() error { return nil }); err == nil {
+		t.Fatal("Guard on a closed log succeeded")
+	}
+}
+
+// Review 3 finding 4: a recover record must not predate any earlier
+// record, not just the init record.
+func TestRecoverBeforeLaterOrdinaryRecordIsRejected(t *testing.T) {
+	t0 := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
+	initE := Entry{Seq: 1, Time: t0, Kind: KindInit, Data: json.RawMessage(`{"tenantId":"` + tenant + `","nonce":"` + strings.Repeat("ab", 32) + `"}`)}
+	h1, err := hashEntry(initE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspectE := Entry{Seq: 2, Time: t0.Add(2 * time.Hour), Kind: KindInspect, Data: json.RawMessage(`1`), Prev: h1}
+	h2, err := hashEntry(inspectE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoverE := Entry{Seq: 3, Time: t0.Add(time.Hour), Kind: KindRecover, Prev: h2,
+		Data: json.RawMessage(`{"reason":"x","unverifiedThrough":2,"previousHead":"` + h2.String() + `"}`)}
+	path := filepath.Join(t.TempDir(), "a.jsonl")
+	if err := os.WriteFile(path, []byte(craft(t, initE)+craft(t, inspectE)+craft(t, recoverE)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Control: the same log without the out-of-order recover opens.
+	ok := filepath.Join(t.TempDir(), "ok.jsonl")
+	if err := os.WriteFile(ok, []byte(craft(t, initE)+craft(t, inspectE)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := Open(ok, clock()); err != nil {
+		t.Fatalf("control log rejected: %v", err)
+	} else {
+		l.Close()
+	}
+	if _, err := Open(path, clock()); err == nil {
+		t.Fatal("recover dated before an earlier inspect record accepted")
+	}
 }

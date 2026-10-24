@@ -320,6 +320,7 @@ func TestDeniedBeforeAnyWrite(t *testing.T) {
 type refusingLedger struct{}
 
 func (refusingLedger) Claim(model.Digest, time.Time) error { return errors.New("ledger unavailable") }
+func (refusingLedger) Guard(time.Time, func() error) error { return errors.New("ledger unavailable") }
 
 func TestBuiltinAllowlistIsIndependentOfPolicy(t *testing.T) {
 	ok := action("a", adminPolicy, "v7")
@@ -604,5 +605,57 @@ func TestZeroExecutorDenies(t *testing.T) {
 	x := &Executor{cfg: Config{Now: e.clock.Now}}
 	if r := x.Execute(context.Background(), p, a); r.Status != StatusDenied {
 		t.Fatalf("status %s", r.Status)
+	}
+}
+
+// recoverBeforeSecondGuard recovers the log just before the executor's
+// second write, deterministically modelling a recovery between writes.
+type recoverBeforeSecondGuard struct {
+	*audit.Log
+	guards  int
+	recover func()
+}
+
+func (r *recoverBeforeSecondGuard) Guard(issued time.Time, fn func() error) error {
+	r.guards++
+	if r.guards == 2 {
+		r.recover()
+	}
+	return r.Log.Guard(issued, fn)
+}
+
+// Review 3 finding 1: a recovery after the claim (between writes) stops
+// the remaining writes of a pre-recovery approval.
+func TestRecoveryBetweenWritesStopsTheRest(t *testing.T) {
+	e, p := twoActionEnv(t)
+	logNow := t0.Add(-time.Minute)
+	log, err := audit.Init(filepath.Join(t.TempDir(), "a.jsonl"), func() time.Time { return logNow }, bytes.NewReader(bytes.Repeat([]byte{1}, 64)), tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	a := e.approve(t, p)
+	e.cfg.Ledger = &recoverBeforeSecondGuard{Log: log, recover: func() {
+		logNow = t0.Add(time.Second)
+		if _, err := log.Recover("lost checkpoint"); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	r := e.executor(t).Execute(context.Background(), p, a)
+	if r.Status != StatusPartial || r.Steps[0].Status != StepWritten || r.Steps[1].Status != StepFailed ||
+		!strings.Contains(r.Steps[1].Err, "predates") || len(e.tenant.Writes()) != 1 {
+		t.Fatalf("status %s steps %+v writes %d", r.Status, r.Steps, len(e.tenant.Writes()))
+	}
+}
+
+func TestMemoryLedgerGuard(t *testing.T) {
+	l := &MemoryLedger{NotBefore: t0}
+	ran := false
+	if err := l.Guard(t0.Add(-time.Second), func() error { ran = true; return nil }); !errors.Is(err, ErrApprovalPredatesLedger) || ran {
+		t.Fatalf("old approval: err %v ran %v", err, ran)
+	}
+	sentinel := errors.New("write failed")
+	if err := l.Guard(t0, func() error { ran = true; return sentinel }); !errors.Is(err, sentinel) || !ran {
+		t.Fatalf("valid approval: err %v ran %v", err, ran)
 	}
 }

@@ -76,8 +76,15 @@ var ErrAlreadyClaimed = errors.New("execute: plan already claimed")
 // It must also refuse approvals issued before the ledger's own start
 // (its last init or recovery), checked under the same lock as the claim:
 // claims made under earlier approvals may be missing from the ledger.
+//
+// Guard runs one write: it takes the ledger's lock, rechecks the approval
+// time against the ledger's start, and runs fn while still holding the
+// lock, so a recovery can neither slip in between the check and the write
+// nor take effect only after the remaining writes. fn must not call the
+// ledger (it would deadlock).
 type Ledger interface {
 	Claim(planHash model.Digest, approvalIssuedAt time.Time) error
+	Guard(approvalIssuedAt time.Time, fn func() error) error
 }
 
 // ErrApprovalPredatesLedger means the approval is older than the ledger.
@@ -92,12 +99,29 @@ type MemoryLedger struct {
 	seen map[model.Digest]bool
 }
 
+func (l *MemoryLedger) admits(approvalIssuedAt time.Time) error {
+	if l.NotBefore.IsZero() || approvalIssuedAt.IsZero() || approvalIssuedAt.Before(l.NotBefore) {
+		return fmt.Errorf("%w: issued at %s, ledger started %s", ErrApprovalPredatesLedger, approvalIssuedAt.UTC(), l.NotBefore.UTC())
+	}
+	return nil
+}
+
+// Guard implements Ledger.
+func (l *MemoryLedger) Guard(approvalIssuedAt time.Time, fn func() error) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.admits(approvalIssuedAt); err != nil {
+		return err
+	}
+	return fn()
+}
+
 // Claim implements Ledger.
 func (l *MemoryLedger) Claim(h model.Digest, approvalIssuedAt time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.NotBefore.IsZero() || approvalIssuedAt.IsZero() || approvalIssuedAt.Before(l.NotBefore) {
-		return fmt.Errorf("%w: issued at %s, ledger started %s", ErrApprovalPredatesLedger, approvalIssuedAt.UTC(), l.NotBefore.UTC())
+	if err := l.admits(approvalIssuedAt); err != nil {
+		return err
 	}
 	if l.seen == nil {
 		l.seen = map[model.Digest]bool{}
@@ -211,13 +235,15 @@ func (e *Executor) Execute(ctx context.Context, p model.Plan, a model.Approval) 
 		r.Steps = append(r.Steps, Step{ActionID: act.ID, Status: StepNotStarted})
 	}
 	for i, act := range p.Actions {
-		if err := e.beforeWrite(ctx, a); err != nil {
-			r.Steps[i].Status = StepFailed
-			r.Steps[i].Err = err.Error()
-			r.Status = failedStatus(i)
-			return r
-		}
-		v, err := e.cfg.Writer.SetConditionalAccessState(ctx, act.Target.ID, act.ExpectedVersion, model.CAState(act.DesiredState))
+		var v string
+		err := e.cfg.Ledger.Guard(a.Statement.IssuedAt, func() error {
+			if err := e.beforeWrite(ctx, a); err != nil {
+				return err
+			}
+			var werr error
+			v, werr = e.cfg.Writer.SetConditionalAccessState(ctx, act.Target.ID, act.ExpectedVersion, model.CAState(act.DesiredState))
+			return werr
+		})
 		if err != nil {
 			r.Steps[i].Status = StepFailed
 			r.Steps[i].Err = err.Error()
