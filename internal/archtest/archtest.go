@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +39,16 @@ type Rule struct {
 // Rules are the trust boundaries from CLAUDE.md. Loosening them requires
 // explicit human approval.
 var Rules = []Rule{
+	{
+		Pkg:       "internal",
+		Forbidden: []string{"reflect", "unsafe"},
+		Reason:    "reflection and unsafe can reach methods the static boundary checks cannot see",
+	},
+	{
+		Pkg:       "cmd",
+		Forbidden: []string{"reflect", "unsafe"},
+		Reason:    "reflection and unsafe can reach methods the static boundary checks cannot see",
+	},
 	{
 		Pkg:       "internal/execute",
 		Forbidden: []string{"internal/plan", "internal/evaluate", "internal/inspect", "internal/mockentra"},
@@ -283,4 +294,83 @@ func writerRefs(fset *token.FileSet, f *ast.File, writerPath string) []string {
 		return true
 	})
 	return out
+}
+
+// WriterMethods returns the method names of the Writer interface declared
+// in dir (the internal/entra source directory). Failing to find the
+// interface is an error, so the check cannot silently become a no-op.
+func WriterMethods(dir string, goFiles []string) ([]string, error) {
+	var out []string
+	found := false
+	for _, name := range goFiles {
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, dir+"/"+name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return nil, err
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			ts, ok := n.(*ast.TypeSpec)
+			if !ok || ts.Name.Name != "Writer" {
+				return true
+			}
+			it, ok := ts.Type.(*ast.InterfaceType)
+			if !ok {
+				return true
+			}
+			found = true
+			for _, m := range it.Methods.List {
+				for _, id := range m.Names {
+					out = append(out, id.Name)
+				}
+			}
+			return false
+		})
+	}
+	if !found || len(out) == 0 {
+		return nil, fmt.Errorf("no Writer interface with methods found in %s", dir)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// CheckWriteCalls reports any selector naming a Writer method in non-test
+// files outside the allowed packages. It is name-based and therefore
+// conservative: it cannot tell a tenant write from an unrelated method of
+// the same name, and it does not need to, because no other code should
+// define one. This closes the gap where a Writer is obtained by type
+// inference (e.g. tenant.Writer().SetConditionalAccessState(...)) without
+// ever naming entra.Writer.
+func CheckWriteCalls(module string, pkgs []Package, methods, allowed []string) ([]string, error) {
+	writerPath := module + "/" + WriterPkg
+	var out []string
+	for _, p := range pkgs {
+		if p.Standard || !within(p.ImportPath, module) || p.ImportPath == writerPath {
+			continue
+		}
+		skip := false
+		for _, a := range allowed {
+			if within(p.ImportPath, module+"/"+a) {
+				skip = true
+			}
+		}
+		if skip {
+			continue
+		}
+		for _, name := range p.GoFiles {
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, p.Dir+"/"+name, nil, parser.SkipObjectResolution)
+			if err != nil {
+				return nil, err
+			}
+			ast.Inspect(f, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if ok && slices.Contains(methods, sel.Sel.Name) {
+					out = append(out, fmt.Sprintf("%s: %s is a tenant write and may only be called from %v", fset.Position(sel.Pos()), sel.Sel.Name, allowed))
+				}
+				return true
+			})
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }

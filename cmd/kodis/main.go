@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
 	"flag"
@@ -149,9 +150,14 @@ type config struct {
 }
 
 func loadConfig(path string) (config, error) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return config{}, err
+	}
+	defer f.Close()
+	b, err := model.ReadLimited(f, maxConfigBytes)
+	if err != nil {
+		return config{}, fmt.Errorf("%s: %w", path, err)
 	}
 	var c config
 	if err := model.DecodeStrict(b, maxConfigBytes, &c); err != nil {
@@ -280,9 +286,10 @@ func (r *runner) pipeline(ctx context.Context, cfg config, tenant *mockentra.Ten
 	if err == nil {
 		h, herr := model.HashPlan(res.Plan)
 		if herr != nil {
-			return fail(r.e, "%v", herr)
+			err = herr
+		} else {
+			planHash = &h
 		}
-		planHash = &h
 	}
 	if !r.record(audit.KindPlan, planHash, map[string]any{"plan": res.Plan, "skipped": res.Skipped, "error": errString(err)}) {
 		return exitError
@@ -332,20 +339,10 @@ func (r *runner) pipeline(ctx context.Context, cfg config, tenant *mockentra.Ten
 		r.say("approval: not approved")
 		return exitNotApproved
 	}
-	priv, err := approve.LoadPrivateKey(keyPath)
+	approval, pub, err := sign(p, approverID, keyPath, pubPath, r.e.now())
 	if err != nil {
-		return fail(r.e, "%v", err)
-	}
-	pub, err := approve.LoadPublicKey(pubPath)
-	if err != nil {
-		return fail(r.e, "%v", err)
-	}
-	signer, err := approve.NewSigner(approverID, priv)
-	if err != nil {
-		return fail(r.e, "%v", err)
-	}
-	approval, err := signer.Approve(p, r.e.now(), approvalTTL)
-	if err != nil {
+		// The human said yes but no valid approval exists: record that.
+		r.record(audit.KindApproval, planHash, map[string]any{"approved": false, "approverId": approverID, "error": err.Error()})
 		return fail(r.e, "%v", err)
 	}
 	if !r.record(audit.KindApproval, planHash, map[string]any{"approved": true, "approval": approval}) {
@@ -356,6 +353,7 @@ func (r *runner) pipeline(ctx context.Context, cfg config, tenant *mockentra.Ten
 	// Execute
 	verifier, err := approve.NewVerifier([]approve.TrustedKey{{ApproverID: approverID, PublicKey: pub}})
 	if err != nil {
+		r.record(audit.KindExecute, planHash, map[string]any{"status": "not_started", "error": err.Error()})
 		return fail(r.e, "%v", err)
 	}
 	x, err := execute.New(execute.Config{
@@ -367,6 +365,7 @@ func (r *runner) pipeline(ctx context.Context, cfg config, tenant *mockentra.Ten
 		Now:      r.e.now,
 	})
 	if err != nil {
+		r.record(audit.KindExecute, planHash, map[string]any{"status": "not_started", "error": err.Error()})
 		return fail(r.e, "%v", err)
 	}
 	tenant.InjectFault(fault)
@@ -403,6 +402,27 @@ func (r *runner) pipeline(ctx context.Context, cfg config, tenant *mockentra.Ten
 		return exitNotVerified
 	}
 	return exitOK
+}
+
+// sign loads the approver keys and signs an approval of p.
+func sign(p model.Plan, approverID, keyPath, pubPath string, now time.Time) (model.Approval, ed25519.PublicKey, error) {
+	priv, err := approve.LoadPrivateKey(keyPath)
+	if err != nil {
+		return model.Approval{}, nil, err
+	}
+	pub, err := approve.LoadPublicKey(pubPath)
+	if err != nil {
+		return model.Approval{}, nil, err
+	}
+	signer, err := approve.NewSigner(approverID, priv)
+	if err != nil {
+		return model.Approval{}, nil, err
+	}
+	a, err := signer.Approve(p, now, approvalTTL)
+	if err != nil {
+		return model.Approval{}, nil, err
+	}
+	return a, pub, nil
 }
 
 // readLine reads one line of at most 256 bytes.

@@ -49,11 +49,12 @@ type Report struct {
 // Verified reports whether every action's post-conditions hold.
 func (r Report) Verified() bool { return r.verified }
 
-// Verify re-reads each target and checks that it is in the desired state,
-// that its version moved past the one the plan expected, and that every
-// break-glass account is still excluded. An error means verification
-// could not be performed; a Report with Verified() false means it was
-// performed and failed.
+// Verify re-reads tenant state and checks, for each action, that the
+// target is in the desired state, that its version moved past the one the
+// plan expected, and that every break-glass account is still excluded.
+// The snapshot must be valid and belong to the plan's tenant. An error
+// means verification could not be performed; a Report with Verified()
+// false means it was performed and failed.
 func Verify(ctx context.Context, r entra.Reader, cfg Config, p model.Plan) (Report, error) {
 	if r == nil {
 		return Report{}, errors.New("verify: nil reader")
@@ -65,17 +66,23 @@ func Verify(ctx context.Context, r entra.Reader, cfg Config, p model.Plan) (Repo
 	if err != nil {
 		return Report{}, fmt.Errorf("verify: %w", err)
 	}
+	snap, err := r.ReadSnapshot(ctx)
+	if err != nil {
+		return Report{}, fmt.Errorf("verify: read snapshot: %w", err)
+	}
+	if err := snap.Validate(); err != nil {
+		return Report{}, fmt.Errorf("verify: invalid snapshot: %w", err)
+	}
+	if snap.TenantID != p.TenantID {
+		return Report{}, fmt.Errorf("verify: reader is for tenant %q, plan is for %q", snap.TenantID, p.TenantID)
+	}
 	rep := Report{PlanHash: h}
 	all := true
 	for _, a := range p.Actions {
 		c := Check{ActionID: a.ID, PolicyID: a.Target.ID, Expected: model.CAState(a.DesiredState)}
-		cur, err := r.ReadConditionalAccessPolicy(ctx, a.Target.ID)
-		switch {
-		case errors.Is(err, entra.ErrNotFound):
+		if cur, ok := snap.Policy(a.Target.ID); !ok {
 			c.Problems = append(c.Problems, "target no longer exists")
-		case err != nil:
-			return Report{}, fmt.Errorf("verify: read %s: %w", a.Target.ID, err)
-		default:
+		} else {
 			c.Observed, c.ObservedVersion = cur.State, cur.Version
 			c.Problems = append(c.Problems, problems(cfg, a, cur)...)
 		}
@@ -88,9 +95,6 @@ func Verify(ctx context.Context, r entra.Reader, cfg Config, p model.Plan) (Repo
 
 func problems(cfg Config, a model.Action, cur model.ConditionalAccessPolicy) []string {
 	var out []string
-	if cur.ID != a.Target.ID {
-		out = append(out, fmt.Sprintf("reader returned policy %q for %q", cur.ID, a.Target.ID))
-	}
 	if string(cur.State) != a.DesiredState {
 		out = append(out, fmt.Sprintf("state is %q, want %q", cur.State, a.DesiredState))
 	}

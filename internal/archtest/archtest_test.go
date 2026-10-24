@@ -120,6 +120,72 @@ func TestCheckWriterUsage(t *testing.T) {
 	}
 }
 
+func writeGo(t *testing.T, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestWriterMethods(t *testing.T) {
+	dir := writeGo(t, "package entra\ntype Reader interface{ Read() }\ntype Writer interface {\n\tSetA() error\n\tSetB() error\n}\n")
+	got, err := WriterMethods(dir, []string{"x.go"})
+	if err != nil || strings.Join(got, ",") != "SetA,SetB" {
+		t.Fatalf("got %v %v", got, err)
+	}
+	for name, body := range map[string]string{
+		"no writer":        "package entra\ntype Reader interface{ Read() }\n",
+		"writer not iface": "package entra\ntype Writer struct{}\n",
+		"empty writer":     "package entra\ntype Writer interface{}\n",
+	} {
+		if _, err := WriterMethods(writeGo(t, body), []string{"x.go"}); err == nil {
+			t.Errorf("%s: expected error (check must not silently pass)", name)
+		}
+	}
+}
+
+func TestCheckWriteCalls(t *testing.T) {
+	methods := []string{"SetConditionalAccessState"}
+	cases := map[string]struct {
+		pkg  string
+		body string
+		want int
+	}{
+		"inferred writer in cli": {"cmd/kodis",
+			"package main\nfunc f(t T) { _, _ = t.Writer().SetConditionalAccessState(nil, \"a\", \"v\", \"enabled\") }\n", 1},
+		"method value": {"internal/verify", "package verify\nvar f = w.SetConditionalAccessState\n", 1},
+		"via local interface": {"internal/plan",
+			"package plan\ntype w interface{ SetConditionalAccessState() }\nfunc f(x w) { x.SetConditionalAccessState() }\n", 1},
+		"executor may write":     {"internal/execute", "package execute\nfunc f() { w.SetConditionalAccessState() }\n", 0},
+		"passing writer is fine": {"cmd/kodis", "package main\nvar c = Config{Writer: t.Writer()}\n", 0},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := writeGo(t, c.body)
+			got, err := CheckWriteCalls(mod, []Package{{ImportPath: mod + "/" + c.pkg, Dir: dir, GoFiles: []string{"x.go"}}}, methods, WriterAllowed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != c.want {
+				t.Fatalf("got %v, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestReflectAndUnsafeForbidden(t *testing.T) {
+	for _, imp := range []string{"reflect", "unsafe"} {
+		for _, pkg := range []string{"internal/verify", "cmd/kodis"} {
+			got := CheckBoundaries(mod, []Package{{ImportPath: mod + "/" + pkg, Imports: []string{imp}}}, Rules)
+			if len(got) != 1 {
+				t.Errorf("%s importing %s: got %v", pkg, imp, got)
+			}
+		}
+	}
+}
+
 func TestCheckWriterUsageParseErrorFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte("not go"), 0o600); err != nil {
@@ -173,6 +239,25 @@ func TestRepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	violations = append(violations, w...)
+
+	var entraPkg *Package
+	for i := range pkgs {
+		if pkgs[i].ImportPath == module+"/"+WriterPkg {
+			entraPkg = &pkgs[i]
+		}
+	}
+	if entraPkg == nil {
+		t.Fatalf("%s not found", WriterPkg)
+	}
+	methods, err := WriterMethods(entraPkg.Dir, entraPkg.GoFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wc, err := CheckWriteCalls(module, pkgs, methods, WriterAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations = append(violations, wc...)
 	for _, v := range violations {
 		t.Error(v)
 	}

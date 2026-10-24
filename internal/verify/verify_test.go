@@ -3,7 +3,6 @@ package verify
 import (
 	"context"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -124,16 +123,36 @@ func TestNotVerified(t *testing.T) {
 	}
 }
 
+// fakeReader serves one policy (or none, if p.ID is empty) through both
+// read methods, so tests do not depend on which one Verify uses.
 type fakeReader struct {
-	p   model.ConditionalAccessPolicy
-	err error
+	p      model.ConditionalAccessPolicy
+	tenant string
+	err    error
 }
 
 func (f fakeReader) ReadSnapshot(context.Context) (model.Snapshot, error) {
-	return model.Snapshot{}, errors.New("not used")
+	if f.err != nil {
+		return model.Snapshot{}, f.err
+	}
+	s := model.Snapshot{TenantID: tenantID}
+	if f.tenant != "" {
+		s.TenantID = f.tenant
+	}
+	if f.p.ID != "" {
+		s.Policies = []model.ConditionalAccessPolicy{f.p}
+	}
+	return s, nil
 }
+
 func (f fakeReader) ReadConditionalAccessPolicy(context.Context, string) (model.ConditionalAccessPolicy, error) {
-	return f.p, f.err
+	if f.err != nil {
+		return model.ConditionalAccessPolicy{}, f.err
+	}
+	if f.p.ID == "" {
+		return model.ConditionalAccessPolicy{}, entra.ErrNotFound
+	}
+	return f.p, nil
 }
 
 func reported() model.ConditionalAccessPolicy {
@@ -149,7 +168,7 @@ func TestFakeReaderCases(t *testing.T) {
 		want   string
 	}{
 		"version unchanged": {func(p *model.ConditionalAccessPolicy) { p.Version = "v7" }, "no write is visible"},
-		"wrong object":      {func(p *model.ConditionalAccessPolicy) { p.ID = "ca-other" }, "reader returned"},
+		"wrong object":      {func(p *model.ConditionalAccessPolicy) { p.ID = "ca-other" }, "no longer exists"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -170,12 +189,46 @@ func TestFakeReaderCases(t *testing.T) {
 }
 
 func TestTargetDeleted(t *testing.T) {
-	rep, err := Verify(context.Background(), fakeReader{err: fmt.Errorf("gone: %w", entra.ErrNotFound)}, cfg, plan())
+	rep, err := Verify(context.Background(), fakeReader{}, cfg, plan())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rep.Verified() || !strings.Contains(rep.Checks[0].Problems[0], "no longer exists") {
 		t.Fatalf("report %+v", rep)
+	}
+}
+
+// Review finding: Verify must bind to the plan's tenant.
+func TestRejectsOtherTenant(t *testing.T) {
+	tn := setup(t)
+	write(t, tn)
+	p := plan()
+	p.TenantID = "tenant-other.example.test"
+	rep, err := Verify(context.Background(), tn.Reader(), cfg, p)
+	if err == nil && rep.Verified() {
+		t.Fatal("verified a plan for another tenant")
+	}
+	rep, err = Verify(context.Background(), fakeReader{p: reported(), tenant: "tenant-other.example.test"}, cfg, plan())
+	if err == nil && rep.Verified() {
+		t.Fatal("verified against a reader for another tenant")
+	}
+}
+
+// Review finding: observed state must be validated, not just compared.
+func TestRejectsInvalidObservedState(t *testing.T) {
+	for name, mutate := range map[string]func(*model.ConditionalAccessPolicy){
+		"empty version":     func(p *model.ConditionalAccessPolicy) { p.Version = "" },
+		"unknown state":     func(p *model.ConditionalAccessPolicy) { p.State = "paused" },
+		"bad excluded user": func(p *model.ConditionalAccessPolicy) { p.ExcludeUsers = append(p.ExcludeUsers, "") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := reported()
+			mutate(&p)
+			rep, err := Verify(context.Background(), fakeReader{p: p}, cfg, plan())
+			if err == nil && rep.Verified() {
+				t.Fatal("verified an invalid observed policy")
+			}
+		})
 	}
 }
 

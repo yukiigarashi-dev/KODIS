@@ -7,10 +7,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/yukiigarashi-dev/kodis/internal/audit"
+	"github.com/yukiigarashi-dev/kodis/internal/mockentra"
 )
 
 var update = flag.Bool("update", false, "rewrite golden files")
@@ -227,6 +229,15 @@ func TestInsecureKeyStopsBeforeExecution(t *testing.T) {
 	if code != exitError || !strings.Contains(errOut, "permissions") || strings.Contains(out, "execute:") {
 		t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
 	}
+	// Review finding: the failed approval must be in the audit log.
+	_, recs := readLog(t, w.log)
+	if got := kinds(recs); got != "inspect,evaluate,plan,policy,approval" {
+		t.Fatalf("audit kinds %s", got)
+	}
+	data := string(recs[len(recs)-1].Data)
+	if !strings.Contains(data, `"approved":false`) || !strings.Contains(data, "permissions") {
+		t.Fatalf("approval record %s", data)
+	}
 }
 
 func TestKeygenNeverOverwrites(t *testing.T) {
@@ -263,5 +274,83 @@ func TestUsage(t *testing.T) {
 	}
 	if code, _, errOut := w.run(t, "baseline", "", "-fault", "meteor"); code != exitError || !strings.Contains(errOut, "unknown fault") {
 		t.Errorf("unknown fault: exit %d %s", code, errOut)
+	}
+}
+
+// feedFIFO creates a FIFO at path and writes zero bytes into it until
+// either the reader closes it or feedCap bytes have been written. It
+// returns a function that unblocks and waits for the writer and reports
+// how many bytes were accepted. The cap keeps the test safe even if the
+// code under test reads without a bound.
+func feedFIFO(t *testing.T, path string, feedCap int) func() int {
+	t.Helper()
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	written := make(chan int, 1)
+	go func() {
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			written <- -1
+			return
+		}
+		defer f.Close()
+		buf := make([]byte, 64<<10)
+		n := 0
+		for n < feedCap {
+			k, err := f.Write(buf[:min(len(buf), feedCap-n)])
+			n += k
+			if err != nil {
+				break
+			}
+		}
+		written <- n
+	}()
+	return func() int {
+		// If the code under test never opened the FIFO, open the read end
+		// ourselves so the writer goroutine can finish.
+		if r, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
+			r.Close()
+		}
+		select {
+		case n := <-written:
+			return n
+		case <-time.After(10 * time.Second):
+			t.Fatal("FIFO writer did not finish")
+			return 0
+		}
+	}
+}
+
+// Review finding: oversized inputs must be rejected without reading them
+// whole. The input is a FIFO fed up to 8 MiB; a bounded reader stops after
+// about the limit (64 KiB config, 4 MiB fixture) plus pipe buffering.
+func TestOversizedStreamsAreRejectedWithoutReadingThem(t *testing.T) {
+	const feedCap = 8 << 20
+	cases := map[string]struct {
+		limit int
+		args  func(fifo, log string) []string
+	}{
+		"config": {maxConfigBytes, func(fifo, log string) []string {
+			return []string{"run", "-config", fifo, "-fixture", scenario("baseline", "tenant.json"), "-audit", log, "-approver", "alice"}
+		}},
+		"fixture": {mockentra.MaxFixtureBytes, func(fifo, log string) []string {
+			return []string{"run", "-config", scenario("baseline", "config.json"), "-fixture", fifo, "-audit", log, "-approver", "alice"}
+		}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := newWorld(t)
+			fifo := filepath.Join(w.dir, "input.fifo")
+			wait := feedFIFO(t, fifo, feedCap)
+			code, _, errOut := w.exec(t, "", c.args(fifo, w.log)...)
+			n := wait()
+			if code != exitError || !strings.Contains(errOut, "exceeds") {
+				t.Fatalf("exit %d, stderr %q", code, errOut)
+			}
+			if n >= feedCap || n > c.limit+(1<<20) {
+				t.Fatalf("%d bytes consumed for a %d-byte limit: input was not bounded", n, c.limit)
+			}
+		})
 	}
 }

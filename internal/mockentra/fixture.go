@@ -113,9 +113,14 @@ func DecodeFixture(data []byte) (Fixture, error) {
 
 // LoadFixture reads and decodes a fixture file.
 func LoadFixture(path string) (Fixture, error) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return Fixture{}, err
+	}
+	defer file.Close()
+	data, err := model.ReadLimited(file, MaxFixtureBytes)
+	if err != nil {
+		return Fixture{}, fmt.Errorf("%s: %w", path, err)
 	}
 	f, err := DecodeFixture(data)
 	if err != nil {

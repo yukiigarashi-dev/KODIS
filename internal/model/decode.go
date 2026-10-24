@@ -27,6 +27,19 @@ func DecodePlan(data []byte) (Plan, error) {
 	return p, nil
 }
 
+// ReadLimited reads all of r, but never more than maxBytes+1 bytes, so an
+// oversized or endless input is rejected without being buffered.
+func ReadLimited(r io.Reader, maxBytes int) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, int64(maxBytes)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxBytes {
+		return nil, &Error{Code: CodeTooLarge, Msg: fmt.Sprintf("input exceeds %d bytes", maxBytes)}
+	}
+	return b, nil
+}
+
 // DecodeStrict decodes a single JSON object into v. It rejects input
 // larger than maxBytes, duplicate object keys (including keys that
 // encoding/json would treat as equal under case folding), unknown fields

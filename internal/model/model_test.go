@@ -365,3 +365,38 @@ func FuzzDecodePlan(f *testing.F) {
 		}
 	})
 }
+
+// capped serves zero bytes up to a hard cap and then fails, so even if
+// ReadLimited's bound is broken the test reads at most cap bytes and fails
+// instead of exhausting memory.
+type capped struct {
+	n, cap int
+}
+
+var errReadPastCap = errors.New("test reader: read past cap (input was not bounded)")
+
+func (c *capped) Read(p []byte) (int, error) {
+	if c.n >= c.cap {
+		return 0, errReadPastCap
+	}
+	k := min(len(p), c.cap-c.n)
+	clear(p[:k])
+	c.n += k
+	return k, nil
+}
+
+func TestReadLimited(t *testing.T) {
+	src := &capped{cap: 8 << 20}
+	_, err := ReadLimited(src, 1000)
+	wantCode(t, err, CodeTooLarge)
+	if src.n > 1000+64<<10 {
+		t.Fatalf("read %d bytes for a 1000-byte limit", src.n)
+	}
+	b, err := ReadLimited(strings.NewReader("abc"), 3)
+	if err != nil || string(b) != "abc" {
+		t.Fatalf("exact size: %q %v", b, err)
+	}
+	if _, err := ReadLimited(strings.NewReader("abcd"), 3); err == nil {
+		t.Fatal("one byte over accepted")
+	}
+}
