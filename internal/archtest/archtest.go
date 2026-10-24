@@ -6,8 +6,11 @@ package archtest
 import (
 	"fmt"
 	"go/ast"
+	"go/build/constraint"
 	"go/parser"
 	"go/token"
+	"io/fs"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -369,6 +372,145 @@ func CheckWriteCalls(module string, pkgs []Package, methods, allowed []string) (
 				}
 				return true
 			})
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// ConstrainedAllowed lists the only non-test files that may carry a build
+// constraint (a //go:build line or a GOOS/GOARCH file name suffix). Files
+// excluded from the default build are invisible to `go list`-based checks,
+// so every such file is an exception that needs human approval.
+var ConstrainedAllowed = []string{
+	"internal/approve/owner_other.go",
+	"internal/approve/owner_unix.go",
+	"internal/audit/lock_other.go",
+	"internal/audit/lock_unix.go",
+}
+
+// SourcePackages walks root and returns one Package per directory holding
+// non-test Go files, with GoFiles listing every such file regardless of
+// build constraints and Imports/Deps set to the files' direct imports.
+// Directories the go tool ignores (testdata, and names starting with "."
+// or "_") are skipped, as is vendor.
+//
+// Running the existing checks on these packages covers files that
+// `go list` leaves out. Their transitive dependencies are not known, so
+// for them the boundary rules are only checked one import deep.
+func SourcePackages(root, module string) ([]Package, error) {
+	byDir := map[string]*Package{}
+	var order []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if path != root && (name == "testdata" || name == "vendor" || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		dir := filepath.Dir(path)
+		p, ok := byDir[dir]
+		if !ok {
+			rel, err := filepath.Rel(root, dir)
+			if err != nil {
+				return err
+			}
+			ip := module
+			if rel != "." {
+				ip = module + "/" + filepath.ToSlash(rel)
+			}
+			p = &Package{ImportPath: ip, Dir: dir}
+			byDir[dir] = p
+			order = append(order, dir)
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+		if err != nil {
+			return err
+		}
+		for _, imp := range f.Imports {
+			ip, err := strconv.Unquote(imp.Path.Value)
+			if err != nil {
+				return err
+			}
+			if !slices.Contains(p.Imports, ip) {
+				p.Imports = append(p.Imports, ip)
+			}
+		}
+		p.GoFiles = append(p.GoFiles, name)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out []Package
+	for _, dir := range order {
+		p := byDir[dir]
+		sort.Strings(p.Imports)
+		p.Deps = p.Imports
+		out = append(out, *p)
+	}
+	return out, nil
+}
+
+// HasBuildTag reports whether the file has a //go:build or // +build line
+// before its package clause.
+func HasBuildTag(path string) (bool, error) {
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly|parser.ParseComments)
+	if err != nil {
+		return false, err
+	}
+	for _, g := range f.Comments {
+		if g.Pos() > f.Package {
+			break
+		}
+		for _, c := range g.List {
+			if constraint.IsGoBuild(c.Text) || constraint.IsPlusBuild(c.Text) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// HasPlatformSuffix reports whether go/build would constrain the file by
+// name: after the first "_", a trailing _GOOS, _GOARCH or _GOOS_GOARCH.
+// The last element alone decides, since _GOOS_GOARCH also ends in GOARCH.
+func HasPlatformSuffix(name string, oses, arches map[string]bool) bool {
+	name = strings.TrimSuffix(strings.TrimSuffix(name, ".go"), "_test")
+	i := strings.Index(name, "_")
+	if i < 0 {
+		return false
+	}
+	l := strings.Split(name[i:], "_")
+	last := l[len(l)-1]
+	return oses[last] || arches[last]
+}
+
+// CheckConstrainedFiles reports constrained non-test files under root that
+// are not in allowed (paths relative to root, slash-separated).
+func CheckConstrainedFiles(root string, pkgs []Package, allowed []string, oses, arches map[string]bool) ([]string, error) {
+	var out []string
+	for _, p := range pkgs {
+		for _, name := range p.GoFiles {
+			path := filepath.Join(p.Dir, name)
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return nil, err
+			}
+			tagged, err := HasBuildTag(path)
+			if err != nil {
+				return nil, err
+			}
+			if (tagged || HasPlatformSuffix(name, oses, arches)) && !slices.Contains(allowed, filepath.ToSlash(rel)) {
+				out = append(out, fmt.Sprintf("%s: build-constrained file is not in ConstrainedAllowed; constrained files escape go list-based boundary checks", rel))
+			}
 		}
 	}
 	sort.Strings(out)

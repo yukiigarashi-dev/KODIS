@@ -258,6 +258,33 @@ func TestRepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	violations = append(violations, wc...)
+
+	// Review 2 finding 3: repeat the checks over every non-test source
+	// file, including ones the default build excludes, and allow build
+	// constraints only on the approved files.
+	src, err := SourcePackages(root, module)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations = append(violations, CheckStdlibOnly(module, src)...)
+	violations = append(violations, CheckBoundaries(module, src, Rules)...)
+	violations = append(violations, CheckImporters(module, src, ImportRules)...)
+	if w, err := CheckWriterUsage(module, src, WriterAllowed); err != nil {
+		t.Fatal(err)
+	} else {
+		violations = append(violations, w...)
+	}
+	if wc, err := CheckWriteCalls(module, src, methods, WriterAllowed); err != nil {
+		t.Fatal(err)
+	} else {
+		violations = append(violations, wc...)
+	}
+	oses, arches := platforms(t)
+	cf, err := CheckConstrainedFiles(root, src, ConstrainedAllowed, oses, arches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations = append(violations, cf...)
 	for _, v := range violations {
 		t.Error(v)
 	}
@@ -270,4 +297,117 @@ func goOutput(t *testing.T, args ...string) string {
 		t.Fatalf("go %s: %v", strings.Join(args, " "), err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// platforms returns the known GOOS and GOARCH values from the toolchain.
+func platforms(t *testing.T) (map[string]bool, map[string]bool) {
+	t.Helper()
+	out := goOutput(t, "tool", "dist", "list")
+	oses, arches := map[string]bool{}, map[string]bool{}
+	for _, line := range strings.Fields(out) {
+		os, arch, ok := strings.Cut(line, "/")
+		if !ok {
+			t.Fatalf("unexpected dist list line %q", line)
+		}
+		oses[os], arches[arch] = true, true
+	}
+	if !oses["linux"] || !oses["windows"] || !arches["amd64"] {
+		t.Fatalf("dist list looks wrong: %v %v", oses, arches)
+	}
+	return oses, arches
+}
+
+func writeFiles(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root := t.TempDir()
+	for rel, body := range files {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+func TestSourcePackagesIncludesExcludedFiles(t *testing.T) {
+	root := writeFiles(t, map[string]string{
+		"cmd/kodis/main.go":            "package main\n",
+		"cmd/kodis/zz_bypass.go":       "//go:build bypass\n\npackage main\n\nimport \"" + mod + "/internal/mockentra\"\n\nfunc f(t *mockentra.Tenant) { t.Writer().SetConditionalAccessState() }\n",
+		"cmd/kodis/main_test.go":       "package main\nimport \"" + mod + "/internal/mockentra\"\n",
+		"internal/verify/v_windows.go": "package verify\nimport \"" + mod + "/internal/mockentra\"\n",
+		"internal/only/x.go":           "//go:build never\n\npackage only\nimport \"example.com/thirdparty\"\n",
+		"testdata/ignored/x.go":        "package ignored\nimport \"example.com/thirdparty\"\n",
+		".hidden/x.go":                 "package hidden\nimport \"example.com/thirdparty\"\n",
+	})
+	src, err := SourcePackages(root, mod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, p := range src {
+		paths = append(paths, p.ImportPath)
+	}
+	if got := strings.Join(paths, ","); got != mod+"/cmd/kodis,"+mod+"/internal/only,"+mod+"/internal/verify" {
+		t.Fatalf("packages %s", got)
+	}
+	for _, p := range src {
+		if p.ImportPath == mod+"/cmd/kodis" && strings.Join(p.GoFiles, ",") != "main.go,zz_bypass.go" {
+			t.Fatalf("cmd/kodis files %v (test files must be excluded, tagged files included)", p.GoFiles)
+		}
+	}
+	calls, err := CheckWriteCalls(mod, src, []string{"SetConditionalAccessState"}, WriterAllowed)
+	if err != nil || len(calls) != 1 {
+		t.Fatalf("write calls in tagged file: %v %v", calls, err)
+	}
+	if got := CheckImporters(mod, src, ImportRules); len(got) != 1 || !strings.Contains(got[0], "internal/verify") {
+		t.Fatalf("mock import from a windows-only file: %v", got)
+	}
+	if got := CheckStdlibOnly(mod, src); len(got) != 1 || !strings.Contains(got[0], "internal/only") {
+		t.Fatalf("third-party import from a never-built package: %v", got)
+	}
+	oses, arches := platforms(t)
+	cf, err := CheckConstrainedFiles(root, src, nil, oses, arches)
+	if err != nil || len(cf) != 3 {
+		t.Fatalf("constrained files: %v %v", cf, err)
+	}
+}
+
+func TestBuildConstraintDetection(t *testing.T) {
+	oses, arches := platforms(t)
+	for name, want := range map[string]bool{
+		"x_windows.go":      true,
+		"x_linux_amd64.go":  true,
+		"x_arm64.go":        true,
+		"owner_unix.go":     false, // "unix" is only a build tag, not a file suffix
+		"linux.go":          false, // no "_": not constrained by name
+		"windows_helper.go": false,
+		"x_other.go":        false,
+	} {
+		if got := HasPlatformSuffix(name, oses, arches); got != want {
+			t.Errorf("%s: got %v want %v", name, got, want)
+		}
+	}
+	root := writeFiles(t, map[string]string{
+		"a.go": "//go:build linux\n\npackage a\n",
+		"b.go": "// +build linux\n\npackage a\n",
+		"c.go": "// Package a is fine.\npackage a\n",
+		"d.go": "package a\n\n//go:build linux\nvar x = 1\n", // after package clause: not a constraint
+	})
+	for name, want := range map[string]bool{"a.go": true, "b.go": true, "c.go": false, "d.go": false} {
+		got, err := HasBuildTag(filepath.Join(root, name))
+		if err != nil || got != want {
+			t.Errorf("%s: got %v %v want %v", name, got, err, want)
+		}
+	}
+	src, err := SourcePackages(root, mod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf, err := CheckConstrainedFiles(root, src, []string{"a.go"}, oses, arches)
+	if err != nil || len(cf) != 1 || !strings.Contains(cf[0], "b.go") {
+		t.Fatalf("allowlist: %v %v", cf, err)
+	}
 }
