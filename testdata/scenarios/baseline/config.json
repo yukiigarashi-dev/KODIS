@@ -1,0 +1,4 @@
+{
+  "tenantId": "tenant-contoso.example.test",
+  "breakGlassUserIds": ["user-breakglass-01", "user-breakglass-02"]
+}

@@ -53,19 +53,19 @@ const (
 // Step records one action's outcome. NewVersion is what the writer
 // claimed; it is evidence, not proof.
 type Step struct {
-	ActionID   string
-	Status     StepStatus
-	NewVersion string
-	Err        string
+	ActionID   string     `json:"actionId"`
+	Status     StepStatus `json:"status"`
+	NewVersion string     `json:"newVersion"`
+	Err        string     `json:"error"`
 }
 
 // Result is the outcome of Execute.
 type Result struct {
-	PlanHash model.Digest
-	Status   Status
+	PlanHash model.Digest `json:"planHash"`
+	Status   Status       `json:"status"`
 	// Reasons explain a denial.
-	Reasons []string
-	Steps   []Step
+	Reasons []string `json:"reasons"`
+	Steps   []Step   `json:"steps"`
 }
 
 // ErrAlreadyClaimed means the plan was already executed (or attempted).

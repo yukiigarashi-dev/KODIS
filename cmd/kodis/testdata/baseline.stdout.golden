@@ -1,0 +1,12 @@
+inspect: 3 conditional access policies in tenant-contoso.example.test
+evaluate: 1 findings
+  [high] ca.mfa-policy-disabled Conditional Access policy ca-require-mfa-admins requires MFA but is disabled
+plan plan-20261025T090000Z (sha256:9918d28ce3b0013ac03eb27c1c9505ad7e744acdd5f7d7786d98d802dfdfe03f)
+  action-0001: conditionalAccess.setState conditionalAccessPolicy/ca-require-mfa-admins disabled -> enabledForReportingButNotEnforced (expects version v7)
+policy: allowed
+To approve as alice, type the first 12 hex characters of the plan hash: 
+approval: signed by alice, expires 2026-10-25T09:15:00Z
+execute: completed
+  action-0001: written 
+verify: verified=true
+audit head: sha256:6ede7392f89acb9c06d3f6202c7adbadfbd7ea7a85560c47a2f46620a3463203
