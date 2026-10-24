@@ -32,9 +32,15 @@ Key-scoped Operations & Deterministic Inspection System。
 ## 開発コマンド
 環境変数 `GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly` を前提にする（.claude/settings.json で設定済み）。
 - フォーマット: `gofmt -l .`（出力が空であること）
-- 静的検査: `go vet ./...`
-- テスト: `go test -race -count=1 ./...`
+- 静的検査: `scripts/safe-test.sh go vet ./...`
+- テスト: `scripts/safe-test.sh go test -race -count=1 ./...`
 - 変更したら上記3つがすべて通ることを確認してから完了と報告する。失敗した場合は出力をそのまま報告する。
+
+## テストの安全性
+- `go test` / `go vet` / 変異テスト / テスト用バイナリの実行は、必ず `scripts/safe-test.sh` 経由で行う。systemd user scope で MemoryMax=2G・MemorySwapMax=0・CPUQuota=200%・TasksMax=512・timeout 300秒 を課す（環境変数で下げられる）。scope を作れない場合は何も実行しない。
+- 変異テストでは上限を下げる（例: `KODIS_MEM_MAX=1G KODIS_TIMEOUT=120`）。
+- テストに上限のない入力（`/dev/zero`、無限に返す Reader など）を使わない。入力側に上限を持たせ、検査対象の上限処理が壊れてもテストが有限量で失敗するようにする。
+- 経緯: 2026-10-25、上限処理を外した変異テストが `/dev/zero` を読み続け、ホストのメモリを枯渇させて端末が OOM kill された。
 
 ## コーディング
 - Go標準ライブラリのみ使う。エラーは握りつぶさない。panic を使わない。

@@ -12,7 +12,9 @@
       "Bash(git log*)",
       "Bash(git show*)",
       "Bash(git branch)",
-      "Bash(git branch --list*)"
+      "Bash(git branch --list*)",
+      "Bash(scripts/safe-test.sh *)",
+      "Bash(./scripts/safe-test.sh *)"
     ],
     "ask": [
       "Bash(git commit *)",
