@@ -41,6 +41,28 @@ func TestCheckBoundariesDetectsViolations(t *testing.T) {
 	}
 }
 
+func TestCheckImporters(t *testing.T) {
+	cases := []struct {
+		name string
+		pkg  Package
+		want int
+	}{
+		{"verify imports mock", Package{ImportPath: mod + "/internal/verify", Deps: []string{mod + "/internal/mockentra"}}, 1},
+		{"new package imports mock transitively", Package{ImportPath: mod + "/internal/newpkg", Deps: []string{mod + "/internal/helper", mod + "/internal/mockentra"}}, 1},
+		{"execute imports mock subpackage", Package{ImportPath: mod + "/internal/execute", Deps: []string{mod + "/internal/mockentra/faults"}}, 1},
+		{"cli imports mock", Package{ImportPath: mod + "/cmd/kodis", Deps: []string{mod + "/internal/mockentra"}}, 0},
+		{"mock itself", Package{ImportPath: mod + "/internal/mockentra", Deps: []string{mod + "/internal/entra"}}, 0},
+		{"prefix is not the mock", Package{ImportPath: mod + "/internal/verify", Deps: []string{mod + "/internal/mockentrax"}}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := CheckImporters(mod, []Package{c.pkg}, ImportRules); len(got) != c.want {
+				t.Fatalf("got %v, want %d violations", got, c.want)
+			}
+		})
+	}
+}
+
 func TestCheckStdlibOnly(t *testing.T) {
 	pkgs := []Package{
 		{ImportPath: mod + "/internal/a", Deps: []string{"fmt", mod + "/internal/b"}},
@@ -145,6 +167,7 @@ func TestRepository(t *testing.T) {
 	violations = append(violations, CheckGoMod(string(gomod))...)
 	violations = append(violations, CheckStdlibOnly(module, pkgs)...)
 	violations = append(violations, CheckBoundaries(module, pkgs, Rules)...)
+	violations = append(violations, CheckImporters(module, pkgs, ImportRules)...)
 	w, err := CheckWriterUsage(module, pkgs, WriterAllowed)
 	if err != nil {
 		t.Fatal(err)

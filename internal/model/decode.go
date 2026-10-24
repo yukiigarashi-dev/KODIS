@@ -15,27 +15,35 @@ const MaxPlanBytes = 1 << 20
 
 const maxDepth = 16
 
-// DecodePlan parses and validates an untrusted encoded plan. It rejects
-// oversized input, duplicate object keys (including keys that
-// encoding/json would treat as equal under case folding), unknown fields,
-// trailing data and anything Validate rejects.
+// DecodePlan parses and validates an untrusted encoded plan.
 func DecodePlan(data []byte) (Plan, error) {
-	if len(data) > MaxPlanBytes {
-		return Plan{}, &Error{Code: CodeTooLarge, Msg: fmt.Sprintf("%d bytes exceeds %d", len(data), MaxPlanBytes)}
-	}
-	if err := checkStructure(data); err != nil {
-		return Plan{}, err
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	var p Plan
-	if err := dec.Decode(&p); err != nil {
-		return Plan{}, &Error{Code: CodeMalformed, Msg: err.Error()}
+	if err := DecodeStrict(data, MaxPlanBytes, &p); err != nil {
+		return Plan{}, err
 	}
 	if err := p.Validate(); err != nil {
 		return Plan{}, err
 	}
 	return p, nil
+}
+
+// DecodeStrict decodes a single JSON object into v. It rejects input
+// larger than maxBytes, duplicate object keys (including keys that
+// encoding/json would treat as equal under case folding), unknown fields
+// and trailing data. It does not validate the result.
+func DecodeStrict(data []byte, maxBytes int, v any) error {
+	if len(data) > maxBytes {
+		return &Error{Code: CodeTooLarge, Msg: fmt.Sprintf("%d bytes exceeds %d", len(data), maxBytes)}
+	}
+	if err := checkStructure(data); err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return &Error{Code: CodeMalformed, Msg: err.Error()}
+	}
+	return nil
 }
 
 // checkStructure walks the token stream: the top level must be a single

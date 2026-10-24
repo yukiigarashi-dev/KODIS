@@ -1,0 +1,45 @@
+{
+  "tenantId": "tenant-contoso.example.test",
+  "users": [
+    {"id": "user-breakglass-01", "displayName": "Break Glass 01"},
+    {"id": "user-breakglass-02", "displayName": "Break Glass 02"},
+    {"id": "user-admin-alice", "displayName": "Alice (synthetic admin)"},
+    {"id": "user-staff-bob", "displayName": "Bob (synthetic staff)"}
+  ],
+  "roles": [
+    {"id": "role-global-admin", "displayName": "Global Administrator"},
+    {"id": "role-security-admin", "displayName": "Security Administrator"}
+  ],
+  "policies": [
+    {
+      "id": "ca-require-mfa-admins",
+      "version": "v7",
+      "displayName": "Require MFA for administrators",
+      "state": "disabled",
+      "includeUsers": [],
+      "excludeUsers": ["user-breakglass-01", "user-breakglass-02"],
+      "includeRoles": ["role-global-admin", "role-security-admin"],
+      "grantControls": ["mfa"]
+    },
+    {
+      "id": "ca-block-legacy-auth",
+      "version": "v3",
+      "displayName": "Block legacy authentication",
+      "state": "enabled",
+      "includeUsers": ["All"],
+      "excludeUsers": ["user-breakglass-01", "user-breakglass-02"],
+      "includeRoles": [],
+      "grantControls": ["block"]
+    },
+    {
+      "id": "ca-require-mfa-all-users",
+      "version": "v2",
+      "displayName": "Require MFA for all users (pilot)",
+      "state": "enabledForReportingButNotEnforced",
+      "includeUsers": ["All"],
+      "excludeUsers": ["user-breakglass-01", "user-breakglass-02"],
+      "includeRoles": [],
+      "grantControls": ["mfa"]
+    }
+  ]
+}

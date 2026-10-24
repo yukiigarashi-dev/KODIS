@@ -70,6 +70,57 @@ var Rules = []Rule{
 	},
 }
 
+// ImportRule restricts which module packages may depend on Pkg. Packages
+// not listed are denied, so new packages are covered automatically.
+type ImportRule struct {
+	Pkg              string
+	AllowedImporters []string
+	Reason           string
+}
+
+// ImportRules restrict access to packages that grant write capability.
+var ImportRules = []ImportRule{
+	{
+		Pkg:              "internal/mockentra",
+		AllowedImporters: []string{"cmd/kodis"},
+		Reason:           "the mock tenant exposes write access without entra.Writer and may only be wired in by the CLI",
+	},
+}
+
+// CheckImporters reports non-test packages that depend, directly or
+// transitively, on a restricted package without being allowed to.
+func CheckImporters(module string, pkgs []Package, rules []ImportRule) []string {
+	var out []string
+	for _, p := range pkgs {
+		if p.Standard || !within(p.ImportPath, module) {
+			continue
+		}
+		for _, r := range rules {
+			target := module + "/" + r.Pkg
+			if within(p.ImportPath, target) {
+				continue
+			}
+			allowed := false
+			for _, a := range r.AllowedImporters {
+				if within(p.ImportPath, module+"/"+a) {
+					allowed = true
+				}
+			}
+			if allowed {
+				continue
+			}
+			for _, d := range p.Deps {
+				if within(d, target) {
+					out = append(out, fmt.Sprintf("%s depends on %s: %s", p.ImportPath, d, r.Reason))
+					break
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // WriterPkg is the package declaring the Writer interface.
 const WriterPkg = "internal/entra"
 
