@@ -210,6 +210,13 @@ func cmdAuditRecover(args []string, e env) int {
 	typed, err := readLine(e.stdin)
 	fmt.Fprintln(e.stdout)
 	if err != nil || typed != id[:approvalPrefixLen] {
+		why := "confirmation did not match the log id"
+		if err != nil {
+			why = "could not read confirmation: " + err.Error()
+		}
+		if _, aerr := log.Append(audit.KindRecoverRefused, nil, map[string]string{"reason": *reason, "refused": why}); aerr != nil {
+			return fail(e, "audit: %v", aerr)
+		}
 		fmt.Fprintln(e.stdout, "recovery: not confirmed")
 		return exitNotApproved
 	}
@@ -296,7 +303,7 @@ func cmdRun(args []string, e env) int {
 	r := runner{e: e, log: log}
 	code := exitError
 	if r.checkLog(*ckpt, cfg.TenantID) {
-		code = r.pipeline(context.Background(), cfg, tenant, fault, *approver, *keyPath, *pubPath, log.NotBefore())
+		code = r.pipeline(context.Background(), cfg, tenant, fault, *approver, *keyPath, *pubPath)
 	}
 	if r.err != nil {
 		fmt.Fprintf(e.stderr, "kodis: audit: %v\n", r.err)
@@ -351,7 +358,7 @@ func (r *runner) say(format string, args ...any) {
 	fmt.Fprintf(r.e.stdout, format+"\n", args...)
 }
 
-func (r *runner) pipeline(ctx context.Context, cfg config, tenant *mockentra.Tenant, fault mockentra.Fault, approverID, keyPath, pubPath string, notBefore time.Time) int {
+func (r *runner) pipeline(ctx context.Context, cfg config, tenant *mockentra.Tenant, fault mockentra.Fault, approverID, keyPath, pubPath string) int {
 	// Inspect
 	snap, err := inspect.Inspect(ctx, tenant.Reader(), cfg.TenantID)
 	if !r.record(audit.KindInspect, nil, map[string]any{"tenantId": cfg.TenantID, "policies": len(snap.Policies), "error": errString(err)}) {
@@ -465,8 +472,6 @@ func (r *runner) pipeline(ctx context.Context, cfg config, tenant *mockentra.Ten
 		Writer:   tenant.Writer(),
 		Ledger:   r.log,
 		Now:      r.e.now,
-
-		ApprovalsNotBefore: notBefore,
 	})
 	if err != nil {
 		r.record(audit.KindExecute, planHash, map[string]any{"status": "not_started", "error": err.Error()})

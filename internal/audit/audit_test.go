@@ -36,6 +36,9 @@ func digest(b byte) model.Digest {
 
 const tenant = "tenant-contoso.example.test"
 
+// approvedLater is an approval time after every test log's init.
+var approvedLater = time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+
 func seeded(b byte) *bytes.Reader { return bytes.NewReader(bytes.Repeat([]byte{b}, 64)) }
 
 // create initializes a new log with a deterministic nonce.
@@ -410,20 +413,20 @@ func TestNonUTCClockIsNormalized(t *testing.T) {
 func TestClaimPersistsAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 	l := create(t, path)
-	if err := l.Claim(digest(7)); err != nil {
+	if err := l.Claim(digest(7), approvedLater); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.Claim(digest(7)); !errors.Is(err, ErrAlreadyClaimed) {
+	if err := l.Claim(digest(7), approvedLater); !errors.Is(err, ErrAlreadyClaimed) {
 		t.Fatalf("second claim: %v", err)
 	}
-	if err := l.Claim(digest(8)); err != nil {
+	if err := l.Claim(digest(8), approvedLater); err != nil {
 		t.Fatalf("other plan: %v", err)
 	}
 	l.Close()
 
 	l2 := open(t, path)
 	defer l2.Close()
-	if err := l2.Claim(digest(7)); !errors.Is(err, ErrAlreadyClaimed) {
+	if err := l2.Claim(digest(7), approvedLater); !errors.Is(err, ErrAlreadyClaimed) {
 		t.Fatalf("claim after restart: %v", err)
 	}
 }
@@ -437,7 +440,7 @@ func TestConcurrentClaimsExactlyOne(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if l.Claim(digest(9)) == nil {
+			if l.Claim(digest(9), approvedLater) == nil {
 				ok.Add(1)
 			}
 		}()

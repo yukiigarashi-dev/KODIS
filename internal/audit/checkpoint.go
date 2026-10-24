@@ -120,10 +120,10 @@ func (l *Log) Recover(reason string) (Record, error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	rec, err := l.appendLocked(KindRecover, nil, map[string]any{
-		"reason":            reason,
-		"unverifiedThrough": l.seq,
-		"previousHead":      l.head,
+	rec, err := l.appendLocked(KindRecover, nil, recoverData{
+		Reason:            reason,
+		UnverifiedThrough: l.seq,
+		PreviousHead:      l.head,
 	})
 	if err != nil {
 		return Record{}, err

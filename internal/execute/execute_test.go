@@ -85,10 +85,9 @@ func setup(t *testing.T) *env {
 			Verifier: v,
 			Reader:   tn.Reader(),
 			Writer:   tn.Writer(),
-			Ledger:   &MemoryLedger{},
-			Now:      c.Now,
 			// The ledger "started" an hour before the test approvals.
-			ApprovalsNotBefore: t0.Add(-time.Hour),
+			Ledger: &MemoryLedger{NotBefore: t0.Add(-time.Hour)},
+			Now:    c.Now,
 		},
 	}
 }
@@ -160,22 +159,54 @@ func TestHappyPath(t *testing.T) {
 	}
 }
 
-// An approval issued before the ledger's last init/recovery is refused
-// even though it is otherwise valid: its claim may have been lost.
-func TestApprovalBeforeLedgerRecoveryIsRefused(t *testing.T) {
+// An approval issued before the ledger's start is refused even though it
+// is otherwise valid: its claim may have been lost.
+func TestApprovalBeforeLedgerStartIsRefused(t *testing.T) {
 	e := setup(t)
 	p := plan()
 	a := e.approve(t, p) // issued at t0
-	e.cfg.ApprovalsNotBefore = t0.Add(time.Second)
+	e.cfg.Ledger = &MemoryLedger{NotBefore: t0.Add(time.Second)}
 	r := e.executor(t).Execute(context.Background(), p, a)
-	if r.Status != StatusDenied || !strings.Contains(strings.Join(r.Reasons, "\n"), "before the ledger") || len(e.tenant.Writes()) != 0 {
+	if r.Status != StatusDenied || !strings.Contains(strings.Join(r.Reasons, "\n"), "predates the ledger") || len(e.tenant.Writes()) != 0 {
 		t.Fatalf("status %s reasons %v writes %d", r.Status, r.Reasons, len(e.tenant.Writes()))
 	}
-	// Issued exactly at the recovery instant: allowed.
+	// Issued exactly at the ledger start: allowed.
 	e2 := setup(t)
-	e2.cfg.ApprovalsNotBefore = t0
+	e2.cfg.Ledger = &MemoryLedger{NotBefore: t0}
 	if r := e2.executor(t).Execute(context.Background(), p, e2.approve(t, p)); r.Status != StatusCompleted {
 		t.Fatalf("boundary: %s %v", r.Status, r.Reasons)
+	}
+}
+
+func TestMemoryLedgerWithoutStartRefuses(t *testing.T) {
+	if err := (&MemoryLedger{}).Claim(model.Digest{1}, t0); !errors.Is(err, ErrApprovalPredatesLedger) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// Review 2 finding 2: an Executor built before a recovery must still
+// refuse approvals issued before it, because the ledger decides at claim
+// time.
+func TestRecoveryAfterExecutorCreationTakesEffect(t *testing.T) {
+	e := setup(t)
+	logNow := t0.Add(-time.Minute)
+	log, err := audit.Init(filepath.Join(t.TempDir(), "a.jsonl"), func() time.Time { return logNow }, bytes.NewReader(bytes.Repeat([]byte{1}, 64)), tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	p := plan()
+	a := e.approve(t, p) // t0, after init
+	e.cfg.Ledger = log
+	x := e.executor(t)
+
+	logNow = t0.Add(time.Second)
+	if _, err := log.Recover("lost checkpoint"); err != nil {
+		t.Fatal(err)
+	}
+	r := x.Execute(context.Background(), p, a)
+	if r.Status != StatusDenied || !strings.Contains(strings.Join(r.Reasons, "\n"), "predates") || len(e.tenant.Writes()) != 0 {
+		t.Fatalf("status %s reasons %v writes %d", r.Status, r.Reasons, len(e.tenant.Writes()))
 	}
 }
 
@@ -288,7 +319,7 @@ func TestDeniedBeforeAnyWrite(t *testing.T) {
 
 type refusingLedger struct{}
 
-func (refusingLedger) Claim(model.Digest) error { return errors.New("ledger unavailable") }
+func (refusingLedger) Claim(model.Digest, time.Time) error { return errors.New("ledger unavailable") }
 
 func TestBuiltinAllowlistIsIndependentOfPolicy(t *testing.T) {
 	ok := action("a", adminPolicy, "v7")
@@ -552,12 +583,11 @@ func TestDroppedWriteIsNotDetectedHere(t *testing.T) {
 func TestNewRequiresAllDependencies(t *testing.T) {
 	e := setup(t)
 	for name, mutate := range map[string]func(*Config){
-		"verifier":  func(c *Config) { c.Verifier = nil },
-		"reader":    func(c *Config) { c.Reader = nil },
-		"writer":    func(c *Config) { c.Writer = nil },
-		"ledger":    func(c *Config) { c.Ledger = nil },
-		"clock":     func(c *Config) { c.Now = nil },
-		"notBefore": func(c *Config) { c.ApprovalsNotBefore = time.Time{} },
+		"verifier": func(c *Config) { c.Verifier = nil },
+		"reader":   func(c *Config) { c.Reader = nil },
+		"writer":   func(c *Config) { c.Writer = nil },
+		"ledger":   func(c *Config) { c.Ledger = nil },
+		"clock":    func(c *Config) { c.Now = nil },
 	} {
 		c := e.cfg
 		mutate(&c)

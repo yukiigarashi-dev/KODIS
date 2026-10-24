@@ -52,9 +52,12 @@ const (
 	KindRecover Kind = "recover"
 	// KindCheckpoint records the outcome of checking an external checkpoint.
 	KindCheckpoint Kind = "checkpoint"
+	// KindRecoverRefused records a recovery that was requested but not
+	// confirmed. It does not move NotBefore.
+	KindRecoverRefused Kind = "recover-refused"
 )
 
-var kinds = []Kind{KindInspect, KindEvaluate, KindPlan, KindPolicy, KindApproval, KindClaim, KindExecute, KindVerify, KindInit, KindRecover, KindCheckpoint}
+var kinds = []Kind{KindInspect, KindEvaluate, KindPlan, KindPolicy, KindApproval, KindClaim, KindExecute, KindVerify, KindInit, KindRecover, KindCheckpoint, KindRecoverRefused}
 
 // Entry is the hashed part of a record. Field order is part of the hash.
 type Entry struct {
@@ -179,6 +182,7 @@ type Log struct {
 	seq       uint64
 	head      model.Digest
 	hashes    []model.Digest // hashes[i] is the hash of record seq i+1
+	maxTime   time.Time      // latest record time
 	logID     model.Digest
 	tenantID  string
 	notBefore time.Time
@@ -263,6 +267,31 @@ type Summary struct {
 	Checkpoint Checkpoint
 	hashes     []model.Digest
 	claimed    map[model.Digest]bool
+	maxTime    time.Time
+}
+
+type recoverData struct {
+	Reason            string       `json:"reason"`
+	UnverifiedThrough uint64       `json:"unverifiedThrough"`
+	PreviousHead      model.Digest `json:"previousHead"`
+}
+
+// validateRecover checks that a recover record's data is complete and
+// consistent with its position in the chain.
+func validateRecover(r Record) error {
+	var d recoverData
+	if err := model.DecodeStrict(r.Data, MaxRecordBytes, &d); err != nil {
+		return err
+	}
+	switch {
+	case strings.TrimSpace(d.Reason) == "":
+		return errors.New("reason is empty")
+	case d.UnverifiedThrough != r.Seq-1:
+		return fmt.Errorf("unverifiedThrough %d, want %d", d.UnverifiedThrough, r.Seq-1)
+	case d.PreviousHead != r.Prev:
+		return errors.New("previousHead does not match the chain")
+	}
+	return nil
 }
 
 // Summarize validates the init record of a chain returned by Chain and
@@ -287,8 +316,24 @@ func Summarize(recs []Record) (Summary, error) {
 				return Summary{}, fmt.Errorf("claim record %d: %w", r.Seq, err)
 			}
 			sum.claimed[h] = true
-		case KindInit, KindRecover:
-			sum.NotBefore = r.Time
+		case KindRecover:
+			if err := validateRecover(r); err != nil {
+				return Summary{}, fmt.Errorf("recover record %d: %w", r.Seq, err)
+			}
+			fallthrough
+		case KindInit:
+			// An init or recover record may never be dated before anything
+			// already in the log: otherwise an appended record could move
+			// NotBefore back and re-admit old approvals.
+			if r.Time.Before(sum.maxTime) {
+				return Summary{}, fmt.Errorf("%s record %d is dated %s, before earlier record time %s", r.Kind, r.Seq, r.Time, sum.maxTime)
+			}
+			if r.Time.After(sum.NotBefore) {
+				sum.NotBefore = r.Time
+			}
+		}
+		if r.Time.After(sum.maxTime) {
+			sum.maxTime = r.Time
 		}
 		sum.hashes = append(sum.hashes, r.Hash)
 	}
@@ -309,7 +354,7 @@ func (l *Log) load(recs []Record) error {
 		return err
 	}
 	l.logID, l.tenantID, l.notBefore = sum.LogID, sum.TenantID, sum.NotBefore
-	l.hashes, l.claimed = sum.hashes, sum.claimed
+	l.hashes, l.claimed, l.maxTime = sum.hashes, sum.claimed, sum.maxTime
 	l.seq, l.head = sum.Checkpoint.Seq, sum.Checkpoint.Head
 	return nil
 }
@@ -387,6 +432,9 @@ func (l *Log) appendLocked(kind Kind, planHash *model.Digest, data any) (Record,
 		return Record{}, fmt.Errorf("audit: encode data: %w", err)
 	}
 	e := Entry{Seq: l.seq + 1, Time: l.now().UTC(), Kind: kind, Data: raw, Prev: l.head}
+	if (kind == KindRecover || kind == KindInit) && e.Time.Before(l.maxTime) {
+		return Record{}, fmt.Errorf("audit: clock is at %s, before the latest record at %s; refusing to date a %s record into the past", e.Time, l.maxTime, kind)
+	}
 	if planHash != nil {
 		e.PlanHash = planHash.String()
 	}
@@ -417,18 +465,30 @@ func (l *Log) appendLocked(kind Kind, planHash *model.Digest, data any) (Record,
 	}
 	l.seq, l.head = e.Seq, h
 	l.hashes = append(l.hashes, h)
+	if e.Time.After(l.maxTime) {
+		l.maxTime = e.Time
+	}
 	return rec, nil
 }
 
 // ErrAlreadyClaimed means a claim record for the plan already exists.
 var ErrAlreadyClaimed = errors.New("audit: plan already claimed")
 
-// Claim records that a plan is about to be executed. Claims persist in
-// the log, so a plan cannot be executed twice even across restarts. It
-// satisfies execute.Ledger.
-func (l *Log) Claim(planHash model.Digest) error {
+// ErrApprovalPredatesLedger means the approval was issued before the
+// log's last init or recovery, so a claim it produced may be missing.
+var ErrApprovalPredatesLedger = errors.New("audit: approval predates the ledger's last init/recovery")
+
+// Claim records that a plan is about to be executed under an approval
+// issued at approvalIssuedAt. Claims persist in the log, so a plan cannot
+// be executed twice even across restarts. The approval time is checked
+// against NotBefore under the same lock as the claim, so a recovery can
+// never slip in between. It satisfies execute.Ledger.
+func (l *Log) Claim(planHash model.Digest, approvalIssuedAt time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if approvalIssuedAt.IsZero() || approvalIssuedAt.Before(l.notBefore) {
+		return fmt.Errorf("%w: issued at %s, NotBefore %s", ErrApprovalPredatesLedger, approvalIssuedAt.UTC(), l.notBefore)
+	}
 	if l.claimed[planHash] {
 		return ErrAlreadyClaimed
 	}

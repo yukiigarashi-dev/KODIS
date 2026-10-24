@@ -4,11 +4,13 @@ package audit
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCheckpointRoundTrip(t *testing.T) {
@@ -118,7 +120,7 @@ func TestTruncationBeforeCheckpointIsDetected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "a.jsonl")
 	l := create(t, path)
 	h := digest(3)
-	if err := l.Claim(h); err != nil { // seq 2
+	if err := l.Claim(h, approvedLater); err != nil { // seq 2
 		t.Fatal(err)
 	}
 	c := l.Checkpoint()
@@ -140,7 +142,7 @@ func TestTruncationAfterCheckpointIsNotDetected(t *testing.T) {
 	l := create(t, path)
 	c := l.Checkpoint() // seq 1
 	h := digest(4)
-	if err := l.Claim(h); err != nil { // seq 2, after the checkpoint
+	if err := l.Claim(h, approvedLater); err != nil { // seq 2, after the checkpoint
 		t.Fatal(err)
 	}
 	l.Close()
@@ -151,7 +153,7 @@ func TestTruncationAfterCheckpointIsNotDetected(t *testing.T) {
 	if err := l.VerifyCheckpoint(c); err != nil {
 		t.Fatalf("expected the old checkpoint to still verify: %v", err)
 	}
-	if err := l.Claim(h); err != nil {
+	if err := l.Claim(h, approvedLater); err != nil {
 		t.Fatalf("expected the removed claim to be claimable again (known limit): %v", err)
 	}
 }
@@ -210,4 +212,135 @@ func TestRecover(t *testing.T) {
 	if !strings.Contains(string(rec.Data), `"unverifiedThrough":3`) {
 		t.Fatalf("recover data %s", rec.Data)
 	}
+}
+
+func appendCrafted(t *testing.T, path string, e Entry) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(craft(t, e)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Review 2 finding 1: a correctly hashed recover record appended after a
+// checkpoint must not be able to move NotBefore back, and its data must
+// be complete and consistent with the chain.
+func TestForgedRecoverRecordsAreRejected(t *testing.T) {
+	for name, mk := range map[string]func(prev Record) Entry{
+		"dated before init": func(prev Record) Entry {
+			return Entry{Seq: 2, Time: prev.Time.Add(-time.Hour), Kind: KindRecover, Prev: prev.Hash,
+				Data: json.RawMessage(`{"reason":"x","unverifiedThrough":1,"previousHead":"` + prev.Hash.String() + `"}`)}
+		},
+		"empty data": func(prev Record) Entry {
+			return Entry{Seq: 2, Time: prev.Time.Add(time.Hour), Kind: KindRecover, Prev: prev.Hash, Data: json.RawMessage(`{}`)}
+		},
+		"blank reason": func(prev Record) Entry {
+			return Entry{Seq: 2, Time: prev.Time.Add(time.Hour), Kind: KindRecover, Prev: prev.Hash,
+				Data: json.RawMessage(`{"reason":"  ","unverifiedThrough":1,"previousHead":"` + prev.Hash.String() + `"}`)}
+		},
+		"wrong range": func(prev Record) Entry {
+			return Entry{Seq: 2, Time: prev.Time.Add(time.Hour), Kind: KindRecover, Prev: prev.Hash,
+				Data: json.RawMessage(`{"reason":"x","unverifiedThrough":7,"previousHead":"` + prev.Hash.String() + `"}`)}
+		},
+		"wrong previous head": func(prev Record) Entry {
+			return Entry{Seq: 2, Time: prev.Time.Add(time.Hour), Kind: KindRecover, Prev: prev.Hash,
+				Data: json.RawMessage(`{"reason":"x","unverifiedThrough":1,"previousHead":"` + digest(9).String() + `"}`)}
+		},
+		"unknown field": func(prev Record) Entry {
+			return Entry{Seq: 2, Time: prev.Time.Add(time.Hour), Kind: KindRecover, Prev: prev.Hash,
+				Data: json.RawMessage(`{"reason":"x","unverifiedThrough":1,"previousHead":"` + prev.Hash.String() + `","notBefore":"2000-01-01T00:00:00Z"}`)}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "a.jsonl")
+			l := create(t, path)
+			l.Close()
+			recs, err := Chain(mustOpen(t, path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			appendCrafted(t, path, mk(recs[0]))
+			if _, err := Open(path, clock()); err == nil {
+				t.Fatal("forged recover record accepted")
+			}
+		})
+	}
+}
+
+func TestRecoverRefusesBackwardsClock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.jsonl")
+	now := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
+	l, err := Init(path, func() time.Time { return now }, seeded(1), tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	now = now.Add(-time.Minute)
+	if _, err := l.Recover("clock went back"); err == nil {
+		t.Fatal("recover dated before the latest record accepted")
+	}
+	if l.NotBefore().Before(time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)) {
+		t.Fatal("NotBefore moved back")
+	}
+}
+
+// Review 2 finding 2: the approval time is checked by the ledger at claim
+// time, so a recovery on the same open log takes effect immediately.
+func TestClaimRejectsApprovalsBeforeNotBefore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.jsonl")
+	now := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
+	l, err := Init(path, func() time.Time { return now }, seeded(1), tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	issued := now.Add(time.Minute)
+
+	if err := l.Claim(digest(1), now.Add(-time.Second)); !errors.Is(err, ErrApprovalPredatesLedger) {
+		t.Fatalf("approval before init: %v", err)
+	}
+	if err := l.Claim(digest(1), time.Time{}); !errors.Is(err, ErrApprovalPredatesLedger) {
+		t.Fatalf("zero approval time: %v", err)
+	}
+	now = issued.Add(time.Minute)
+	if _, err := l.Recover("lost checkpoint"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Claim(digest(1), issued); !errors.Is(err, ErrApprovalPredatesLedger) {
+		t.Fatalf("approval before recovery on the same open log: %v", err)
+	}
+	if err := l.Claim(digest(1), now); err != nil {
+		t.Fatalf("approval at the recovery instant: %v", err)
+	}
+	// Rejected claims wrote nothing.
+	if recs, err := Chain(mustOpen(t, path)); err != nil || kindsOf(recs) != "init,recover,claim" {
+		t.Fatalf("log %s %v", kindsOf(recs), err)
+	}
+}
+
+func TestRecoverRefusedDoesNotMoveNotBefore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.jsonl")
+	l := create(t, path)
+	before := l.NotBefore()
+	if _, err := l.Append(KindRecoverRefused, nil, map[string]string{"reason": "x"}); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	l = open(t, path)
+	defer l.Close()
+	if !l.NotBefore().Equal(before) {
+		t.Fatal("recover-refused moved NotBefore")
+	}
+}
+
+func kindsOf(recs []Record) string {
+	var ks []string
+	for _, r := range recs {
+		ks = append(ks, string(r.Kind))
+	}
+	return strings.Join(ks, ",")
 }

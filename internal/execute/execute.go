@@ -73,20 +73,32 @@ var ErrAlreadyClaimed = errors.New("execute: plan already claimed")
 
 // Ledger records which plans have been claimed for execution. Claim must
 // be atomic: of concurrent claims for the same hash, exactly one succeeds.
+// It must also refuse approvals issued before the ledger's own start
+// (its last init or recovery), checked under the same lock as the claim:
+// claims made under earlier approvals may be missing from the ledger.
 type Ledger interface {
-	Claim(planHash model.Digest) error
+	Claim(planHash model.Digest, approvalIssuedAt time.Time) error
 }
 
+// ErrApprovalPredatesLedger means the approval is older than the ledger.
+var ErrApprovalPredatesLedger = errors.New("execute: approval predates the ledger")
+
 // MemoryLedger is an in-process Ledger. It does not survive restarts.
+// NotBefore is the ledger's start; it must be set.
 type MemoryLedger struct {
+	NotBefore time.Time
+
 	mu   sync.Mutex
 	seen map[model.Digest]bool
 }
 
 // Claim implements Ledger.
-func (l *MemoryLedger) Claim(h model.Digest) error {
+func (l *MemoryLedger) Claim(h model.Digest, approvalIssuedAt time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.NotBefore.IsZero() || approvalIssuedAt.IsZero() || approvalIssuedAt.Before(l.NotBefore) {
+		return fmt.Errorf("%w: issued at %s, ledger started %s", ErrApprovalPredatesLedger, approvalIssuedAt.UTC(), l.NotBefore.UTC())
+	}
 	if l.seen == nil {
 		l.seen = map[model.Digest]bool{}
 	}
@@ -105,11 +117,6 @@ type Config struct {
 	Writer   entra.Writer
 	Ledger   Ledger
 	Now      func() time.Time
-	// ApprovalsNotBefore rejects approvals issued before it. Callers set it
-	// to the ledger's last init or recovery time: claims made under
-	// earlier approvals may be missing from the ledger, so those approvals
-	// could otherwise be replayed. Required.
-	ApprovalsNotBefore time.Time
 }
 
 // Executor applies approved plans.
@@ -130,8 +137,6 @@ func New(cfg Config) (*Executor, error) {
 		return nil, errors.New("execute: ledger is required")
 	case cfg.Now == nil:
 		return nil, errors.New("execute: clock is required")
-	case cfg.ApprovalsNotBefore.IsZero():
-		return nil, errors.New("execute: ApprovalsNotBefore is required")
 	}
 	return &Executor{cfg: cfg}, nil
 }
@@ -176,9 +181,6 @@ func (e *Executor) Execute(ctx context.Context, p model.Plan, a model.Approval) 
 	if err := e.cfg.Verifier.Verify(a, p, e.cfg.Now()); err != nil {
 		return denied(r, "approval: %v", err)
 	}
-	if nb := e.cfg.ApprovalsNotBefore; nb.IsZero() || a.Statement.IssuedAt.Before(nb) {
-		return denied(r, "approval: issued at %s, before the ledger's last init/recovery at %s", a.Statement.IssuedAt, nb.UTC())
-	}
 	for _, act := range p.Actions {
 		if err := checkBuiltin(act); err != nil {
 			return denied(r, "%v", err)
@@ -201,7 +203,7 @@ func (e *Executor) Execute(ctx context.Context, p model.Plan, a model.Approval) 
 		}
 		return r
 	}
-	if err := e.cfg.Ledger.Claim(h); err != nil {
+	if err := e.cfg.Ledger.Claim(h, a.Statement.IssuedAt); err != nil {
 		return denied(r, "ledger: %v", err)
 	}
 

@@ -532,8 +532,9 @@ func TestAuditRecover(t *testing.T) {
 	if code != exitNotApproved || !strings.Contains(out, "not confirmed") {
 		t.Fatalf("unconfirmed recovery: exit %d %s", code, out)
 	}
-	if _, recs := readLog(t, w.log); kinds(recs) != "init" {
-		t.Fatalf("unconfirmed recovery wrote %s", kinds(recs))
+	// Review 2 finding 5: the refusal is recorded, without moving NotBefore.
+	if _, recs := readLog(t, w.log); kinds(recs) != "init,recover-refused" || !strings.Contains(string(recs[1].Data), "did not match") {
+		t.Fatalf("unconfirmed recovery: audit %s", kinds(recs))
 	}
 
 	m := regexp.MustCompile(`audit log ([0-9a-f]{64})`).FindStringSubmatch(out)
@@ -545,7 +546,7 @@ func TestAuditRecover(t *testing.T) {
 		t.Fatalf("recovery: exit %d %s %s", code, out, errOut)
 	}
 	_, recs := readLog(t, w.log)
-	if kinds(recs) != "init,recover" || !strings.Contains(string(recs[1].Data), "checkpoint store lost") {
+	if kinds(recs) != "init,recover-refused,recover" || !strings.Contains(string(recs[2].Data), "checkpoint store lost") {
 		t.Fatalf("audit %s", kinds(recs))
 	}
 	// The new checkpoint works for a normal run.
@@ -579,7 +580,7 @@ func TestApprovalsIssuedBeforeRecoveryAreRefused(t *testing.T) {
 	w.skew = 0
 	in := approvalInput(t, "baseline")
 	code, out, errOut := w.run(t, "baseline", in)
-	if code != exitNotExecuted || !strings.Contains(out, "before the ledger") {
+	if code != exitNotExecuted || !strings.Contains(out, "predates the ledger") {
 		t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
 	}
 }
