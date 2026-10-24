@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yukiigarashi-dev/kodis/internal/approve"
+	"github.com/yukiigarashi-dev/kodis/internal/audit"
 	"github.com/yukiigarashi-dev/kodis/internal/entra"
 	"github.com/yukiigarashi-dev/kodis/internal/mockentra"
 	"github.com/yukiigarashi-dev/kodis/internal/model"
@@ -24,6 +25,9 @@ const (
 	adminPolicy = "ca-require-mfa-admins"
 	pilotPolicy = "ca-require-mfa-all-users"
 )
+
+// The persistent audit log must be usable as the executor's ledger.
+var _ Ledger = (*audit.Log)(nil)
 
 var t0 = time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
 

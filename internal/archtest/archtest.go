@@ -64,6 +64,11 @@ var Rules = []Rule{
 		Reason:    "approval only signs and verifies plan hashes; it must not reach tenant state or networks",
 	},
 	{
+		Pkg:       "internal/audit",
+		Forbidden: []string{"internal/execute", "internal/entra", "internal/policy", "internal/plan", "net", "net/http", "os/exec"},
+		Reason:    "the audit log records decisions; it must not reach tenant state or make them",
+	},
+	{
 		Pkg:       "internal/evaluate",
 		Forbidden: []string{"internal/execute"},
 		Reason:    "evaluation is read-only",
