@@ -4,12 +4,14 @@
 package archtest
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/build/constraint"
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -396,9 +398,10 @@ var ConstrainedAllowed = []string{
 // build constraints, Imports set to the files' direct imports and Deps to
 // the direct imports plus every module package reachable through them.
 //
-// Only directories whose name starts with "." are skipped, because such
-// paths cannot be imported. testdata, vendor and "_" directories are
-// walked: `./...` ignores them, but they can still be imported explicitly.
+// Every directory is walked, including ".", "_", testdata and vendor
+// directories: `./...` ignores them, but they can still be imported
+// explicitly. Only nested modules (directories below root holding a
+// go.mod) are skipped, because they are not part of this module.
 //
 // Running the existing checks on these packages covers files that
 // `go list` leaves out. Deps is computed over all files of every package,
@@ -413,8 +416,15 @@ func SourcePackages(root, module string) ([]Package, error) {
 		}
 		name := d.Name()
 		if d.IsDir() {
-			if path != root && strings.HasPrefix(name, ".") {
+			if path == root {
+				return nil
+			}
+			_, err := os.Lstat(filepath.Join(path, "go.mod"))
+			if err == nil {
 				return filepath.SkipDir
+			}
+			if !errors.Is(err, fs.ErrNotExist) {
+				return err
 			}
 			return nil
 		}
@@ -547,6 +557,48 @@ func CheckConstrainedFiles(root string, pkgs []Package, allowed []string, oses, 
 			}
 			if (tagged || HasPlatformSuffix(name, oses, arches)) && !slices.Contains(allowed, filepath.ToSlash(rel)) {
 				out = append(out, fmt.Sprintf("%s: build-constrained file is not in ConstrainedAllowed; constrained files escape go list-based boundary checks", rel))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// CheckUnresolvedImports reports imports of module packages that are not
+// among pkgs. SourcePackages computes Deps only through packages it found,
+// so an import it cannot resolve would otherwise end the closure silently.
+func CheckUnresolvedImports(module string, pkgs []Package) []string {
+	known := map[string]bool{}
+	for _, p := range pkgs {
+		known[p.ImportPath] = true
+	}
+	var out []string
+	for _, p := range pkgs {
+		for _, ip := range p.Imports {
+			if within(ip, module) && !known[ip] {
+				out = append(out, fmt.Sprintf("%s imports %s, which has no non-test Go files in the module", p.ImportPath, ip))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// CheckIgnoredDirs reports packages under root in directories that
+// `./...` skips (an element starting with "." or "_", testdata, vendor).
+// go vet and go test never see them, so production code must not live
+// there.
+func CheckIgnoredDirs(root string, pkgs []Package) ([]string, error) {
+	var out []string
+	for _, p := range pkgs {
+		rel, err := filepath.Rel(root, p.Dir)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range strings.Split(filepath.ToSlash(rel), "/") {
+			if e != "." && (strings.HasPrefix(e, ".") || strings.HasPrefix(e, "_") || e == "testdata" || e == "vendor") {
+				out = append(out, fmt.Sprintf("%s: Go source in a directory ./... ignores (%s)", p.ImportPath, e))
+				break
 			}
 		}
 	}

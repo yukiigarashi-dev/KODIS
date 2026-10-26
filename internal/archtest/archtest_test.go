@@ -303,6 +303,13 @@ func TestRepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	violations = append(violations, cf...)
+	// Review 4 finding 2.
+	violations = append(violations, CheckUnresolvedImports(module, src)...)
+	ig, err := CheckIgnoredDirs(root, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations = append(violations, ig...)
 	for _, v := range violations {
 		t.Error(v)
 	}
@@ -362,8 +369,12 @@ func TestSourcePackagesIncludesExcludedFiles(t *testing.T) {
 		"_bridge/b.go":                  bypass,
 		"internal/testdata/bridge/b.go": bypass,
 		"vendor/v/v.go":                 "package v\nimport \"example.com/thirdparty\"\n",
-		// Dot directories cannot be imported and are skipped.
+		// Review 4 finding 2: dot directories can be imported too.
 		".hidden/x.go": "package hidden\nimport \"example.com/thirdparty\"\n",
+		// A nested module is not part of this module.
+		"nested/go.mod": "module example.test/nested\n",
+		"nested/x.go":   "package nested\nimport \"example.com/thirdparty\"\n",
+		"nested/y/y.go": "package y\nimport \"example.com/thirdparty\"\n",
 	})
 	src, err := SourcePackages(root, mod)
 	if err != nil {
@@ -374,7 +385,7 @@ func TestSourcePackagesIncludesExcludedFiles(t *testing.T) {
 		paths = append(paths, p.ImportPath)
 	}
 	slices.Sort(paths)
-	want := []string{mod + "/_bridge", mod + "/cmd/kodis", mod + "/internal/only", mod + "/internal/testdata/bridge", mod + "/internal/verify", mod + "/vendor/v"}
+	want := []string{mod + "/.hidden", mod + "/_bridge", mod + "/cmd/kodis", mod + "/internal/only", mod + "/internal/testdata/bridge", mod + "/internal/verify", mod + "/vendor/v"}
 	if !slices.Equal(paths, want) {
 		t.Fatalf("packages %v, want %v", paths, want)
 	}
@@ -390,8 +401,8 @@ func TestSourcePackagesIncludesExcludedFiles(t *testing.T) {
 	if got := CheckImporters(mod, src, ImportRules); len(got) != 3 {
 		t.Fatalf("mock imports from windows-only, _bridge and testdata packages: %v", got)
 	}
-	if got := CheckStdlibOnly(mod, src); len(got) != 2 {
-		t.Fatalf("third-party imports from never-built and vendor packages: %v", got)
+	if got := CheckStdlibOnly(mod, src); len(got) != 3 {
+		t.Fatalf("third-party imports from never-built, vendor and hidden packages: %v", got)
 	}
 	oses, arches := platforms(t)
 	cf, err := CheckConstrainedFiles(root, src, nil, oses, arches)
@@ -427,6 +438,64 @@ func TestSourcePackagesTransitiveThroughConstrainedFile(t *testing.T) {
 	got := CheckBoundaries(mod, src, Rules)
 	if len(got) != 1 || !strings.Contains(got[0], "internal/approve depends on "+mod+"/internal/plan") {
 		t.Fatalf("approve -> bridge -> plan not reported: %v", got)
+	}
+}
+
+// Review 4 finding 2: a dot directory reached only from a build-
+// constrained file is neither in go list output nor skipped by the walk.
+func TestSourcePackagesHiddenBridge(t *testing.T) {
+	root := writeFiles(t, map[string]string{
+		"internal/approve/owner_unix.go":  "//go:build unix\n\npackage approve\n",
+		"internal/approve/owner_other.go": "//go:build !unix\n\npackage approve\n\nimport \"" + mod + "/.hidden\"\n\nvar _ = hidden.F\n",
+		".hidden/h.go":                    "package hidden\n\nimport \"" + mod + "/internal/mockentra\"\n\nfunc F(t *mockentra.Tenant) { t.Writer().SetConditionalAccessState() }\n",
+		"internal/mockentra/m.go":         "package mockentra\n",
+	})
+	src, err := SourcePackages(root, mod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := CheckImporters(mod, src, ImportRules)
+	if len(got) != 2 || !strings.Contains(got[0], mod+"/.hidden depends") || !strings.Contains(got[1], mod+"/internal/approve depends") {
+		t.Fatalf("mock reached via hidden package: %v", got)
+	}
+	calls, err := CheckWriteCalls(mod, src, []string{"SetConditionalAccessState"}, WriterAllowed)
+	if err != nil || len(calls) != 1 {
+		t.Fatalf("write call in hidden package: %v %v", calls, err)
+	}
+}
+
+func TestCheckUnresolvedImports(t *testing.T) {
+	pkgs := []Package{
+		{ImportPath: mod + "/internal/a", Imports: []string{"fmt", mod + "/internal/b", mod + "/internal/missing"}},
+		{ImportPath: mod + "/internal/b", Imports: []string{mod + "/.gone"}},
+	}
+	got := CheckUnresolvedImports(mod, pkgs)
+	if len(got) != 2 || !strings.Contains(got[0], "/internal/missing") || !strings.Contains(got[1], "/.gone") {
+		t.Fatalf("got %v", got)
+	}
+	if got := CheckUnresolvedImports(mod, pkgs[:1]); len(got) != 2 {
+		t.Fatalf("b missing from pkgs must be reported too: %v", got)
+	}
+}
+
+func TestCheckIgnoredDirs(t *testing.T) {
+	root := writeFiles(t, map[string]string{
+		"x.go":                   "package kodis\n",
+		"internal/a/a.go":        "package a\n",
+		"internal/a_b/c.go":      "package c\n", // "_" not at the start
+		".hidden/h.go":           "package h\n",
+		"_bridge/b.go":           "package b\n",
+		"internal/testdata/t.go": "package t\n",
+		"vendor/v/v.go":          "package v\n",
+		"internal/x/.y/z.go":     "package z\n",
+	})
+	src, err := SourcePackages(root, mod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := CheckIgnoredDirs(root, src)
+	if err != nil || len(got) != 5 {
+		t.Fatalf("got %v %v, want 5", got, err)
 	}
 }
 
