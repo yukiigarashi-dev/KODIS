@@ -389,33 +389,38 @@ func TestGuardSerializesWithRecover(t *testing.T) {
 	}
 }
 
-// Review 4 finding 4: Recover takes the log's lock, so it cannot run
-// inside a guarded write (TestGuardSerializesWithRecover shows fn holds
-// it). This cannot fail on correct code: Recover never completes while
-// the lock is held. A Recover without the lock completes at once and is
-// caught unless it takes longer than the grace period.
-func TestRecoverWaitsForTheLock(t *testing.T) {
+// Review 4 finding 4 / review 5 finding 3: Recover takes the log's lock,
+// so it cannot run inside a guarded write (TestGuardSerializesWithRecover
+// shows fn holds it). Recover reads the injected clock while appending
+// its record; the clock observes the lock there, without relying on
+// timing.
+func TestRecoverHoldsTheLock(t *testing.T) {
 	now := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
-	l, err := Init(filepath.Join(t.TempDir(), "a.jsonl"), func() time.Time { return now }, seeded(1), tenant)
+	var l *Log
+	watching, calls, unlocked := false, 0, 0
+	clk := func() time.Time {
+		if watching {
+			calls++
+			if l.mu.TryLock() {
+				l.mu.Unlock()
+				unlocked++
+			}
+		}
+		return now
+	}
+	var err error
+	l, err = Init(filepath.Join(t.TempDir(), "a.jsonl"), clk, seeded(1), tenant)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	done := make(chan error, 1)
-	l.mu.Lock()
-	go func() {
-		_, err := l.Recover("lost checkpoint")
-		done <- err
-	}()
-	select {
-	case <-done:
-		l.mu.Unlock()
-		t.Fatal("Recover completed while the log's lock was held")
-	case <-time.After(200 * time.Millisecond):
-	}
-	l.mu.Unlock()
-	if err := <-done; err != nil {
+	watching = true
+	if _, err := l.Recover("lost checkpoint"); err != nil {
 		t.Fatal(err)
+	}
+	watching = false
+	if calls == 0 || unlocked != 0 {
+		t.Fatalf("clock read %d times by Recover, %d of them without the lock held", calls, unlocked)
 	}
 }
 
