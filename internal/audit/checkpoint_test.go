@@ -9,10 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/yukiigarashi-dev/kodis/internal/model"
 )
 
 func TestCheckpointRoundTrip(t *testing.T) {
@@ -347,51 +347,124 @@ func kindsOf(recs []Record) string {
 	return strings.Join(ks, ",")
 }
 
-// Review 3 finding 1 (ledger side): Recover cannot complete while a
-// guarded write is running, and the next Guard sees it.
+// Review 3 finding 1 (ledger side), made deterministic for review 4
+// finding 4: fn runs while the log's lock is held (Recover, Claim, Append
+// and Close all take it), and the next Guard sees a recovery.
 func TestGuardSerializesWithRecover(t *testing.T) {
 	now := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
-	var mu sync.Mutex
-	clk := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	clk := func() time.Time { return now }
 	l, err := Init(filepath.Join(t.TempDir(), "a.jsonl"), clk, seeded(1), tenant)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer l.Close()
 	issued := now.Add(time.Minute)
-	mu.Lock()
 	now = issued.Add(time.Minute)
-	mu.Unlock()
 
-	var recovered atomic.Bool
-	done := make(chan struct{})
+	ran := false
 	err = l.Guard(issued, func() error {
-		go func() {
-			defer close(done)
-			if _, err := l.Recover("lost checkpoint"); err != nil {
-				t.Error(err)
-			}
-			recovered.Store(true)
-		}()
-		time.Sleep(50 * time.Millisecond)
-		if recovered.Load() {
-			return errors.New("Recover completed while a guarded write held the lock")
+		ran = true
+		if l.mu.TryLock() {
+			l.mu.Unlock()
+			return errors.New("fn ran without the log's lock held")
 		}
 		return nil
 	})
+	if err != nil || !ran {
+		t.Fatalf("Guard: %v ran %v", err, ran)
+	}
+	if _, err := l.Recover("lost checkpoint"); err != nil {
+		t.Fatal(err)
+	}
+	ran = false
+	if err := l.Guard(issued, func() error { ran = true; return nil }); !errors.Is(err, ErrApprovalPredatesLedger) || ran {
+		t.Fatalf("Guard after recovery: %v ran %v", err, ran)
+	}
+	if err := l.Guard(time.Time{}, func() error { ran = true; return nil }); !errors.Is(err, ErrApprovalPredatesLedger) || ran {
+		t.Fatalf("zero approval time: %v ran %v", err, ran)
+	}
+	l.Close()
+	if err := l.Guard(now, func() error { ran = true; return nil }); err == nil || ran {
+		t.Fatalf("Guard on a closed log: %v ran %v", err, ran)
+	}
+}
+
+// Review 4 finding 4: Recover takes the log's lock, so it cannot run
+// inside a guarded write (TestGuardSerializesWithRecover shows fn holds
+// it). This cannot fail on correct code: Recover never completes while
+// the lock is held. A Recover without the lock completes at once and is
+// caught unless it takes longer than the grace period.
+func TestRecoverWaitsForTheLock(t *testing.T) {
+	now := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
+	l, err := Init(filepath.Join(t.TempDir(), "a.jsonl"), func() time.Time { return now }, seeded(1), tenant)
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-done
-	if err := l.Guard(issued, func() error { return nil }); !errors.Is(err, ErrApprovalPredatesLedger) {
-		t.Fatalf("Guard after recovery: %v", err)
+	defer l.Close()
+	done := make(chan error, 1)
+	l.mu.Lock()
+	go func() {
+		_, err := l.Recover("lost checkpoint")
+		done <- err
+	}()
+	select {
+	case <-done:
+		l.mu.Unlock()
+		t.Fatal("Recover completed while the log's lock was held")
+	case <-time.After(200 * time.Millisecond):
 	}
-	if err := l.Guard(time.Time{}, func() error { return nil }); !errors.Is(err, ErrApprovalPredatesLedger) {
-		t.Fatalf("zero approval time: %v", err)
+	l.mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Review 4 finding 4: a failing fn releases the lock, its error reaches
+// the caller unchanged, and the claim made before it stays, also after
+// reopening the log.
+func TestGuardErrorKeepsClaim(t *testing.T) {
+	now := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
+	clk := func() time.Time { return now }
+	path := filepath.Join(t.TempDir(), "a.jsonl")
+	l, err := Init(path, clk, seeded(1), tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := model.Digest{7}
+	issued := now.Add(time.Minute)
+	now = issued.Add(time.Minute)
+	if err := l.Claim(h, issued); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("write failed")
+	if err := l.Guard(issued, func() error { return sentinel }); !errors.Is(err, sentinel) {
+		t.Fatalf("Guard: %v", err)
+	}
+	if !l.mu.TryLock() {
+		t.Fatal("lock still held after fn failed")
+	}
+	l.mu.Unlock()
+	if err := l.Claim(h, issued); !errors.Is(err, ErrAlreadyClaimed) {
+		t.Fatalf("second claim: %v", err)
 	}
 	l.Close()
-	if err := l.Guard(now, func() error { return nil }); err == nil {
-		t.Fatal("Guard on a closed log succeeded")
+	l = open(t, path)
+	defer l.Close()
+	if err := l.Claim(h, issued); !errors.Is(err, ErrAlreadyClaimed) {
+		t.Fatalf("claim after reopen: %v", err)
+	}
+}
+
+// Review 4 finding 3.
+func TestZeroLogRefuses(t *testing.T) {
+	var l Log
+	ran := false
+	now := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
+	if err := l.Guard(now, func() error { ran = true; return nil }); !errors.Is(err, ErrNotInitialized) || ran {
+		t.Fatalf("Guard: %v ran %v", err, ran)
+	}
+	if err := l.Claim(model.Digest{1}, now); !errors.Is(err, ErrNotInitialized) {
+		t.Fatalf("Claim: %v", err)
 	}
 }
 

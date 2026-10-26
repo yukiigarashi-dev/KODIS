@@ -646,6 +646,23 @@ func TestRecoveryBetweenWritesStopsTheRest(t *testing.T) {
 		!strings.Contains(r.Steps[1].Err, "predates") || len(e.tenant.Writes()) != 1 {
 		t.Fatalf("status %s steps %+v writes %d", r.Status, r.Steps, len(e.tenant.Writes()))
 	}
+	// Review 4 finding 4: the same approval cannot retry the remaining
+	// write, through the log directly or through a new executor.
+	h, err := model.HashPlan(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Claim(h, a.Statement.IssuedAt); err == nil {
+		t.Fatal("claim with the pre-recovery approval accepted")
+	}
+	e.cfg.Ledger = log
+	r = e.executor(t).Execute(context.Background(), p, a)
+	if r.Status != StatusDenied || len(e.tenant.Writes()) != 1 {
+		t.Fatalf("retry: status %s reasons %v writes %d", r.Status, r.Reasons, len(e.tenant.Writes()))
+	}
+	if got := e.state(t, pilotPolicy).State; got != model.CAStateDisabled {
+		t.Fatalf("unwritten policy state %s", got)
+	}
 }
 
 func TestMemoryLedgerGuard(t *testing.T) {
@@ -657,5 +674,24 @@ func TestMemoryLedgerGuard(t *testing.T) {
 	sentinel := errors.New("write failed")
 	if err := l.Guard(t0, func() error { ran = true; return sentinel }); !errors.Is(err, sentinel) || !ran {
 		t.Fatalf("valid approval: err %v ran %v", err, ran)
+	}
+}
+
+// Review 4 finding 3: every ledger in the repository refuses to run a
+// write, or claim, before it has been started. Guard must not run fn.
+func TestZeroLedgersRefuse(t *testing.T) {
+	for name, l := range map[string]Ledger{
+		"MemoryLedger": &MemoryLedger{},
+		"audit.Log":    &audit.Log{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ran := false
+			if err := l.Guard(t0, func() error { ran = true; return nil }); err == nil || ran {
+				t.Fatalf("Guard: err %v ran %v", err, ran)
+			}
+			if err := l.Claim(model.Digest{1}, t0); err == nil {
+				t.Fatal("Claim succeeded")
+			}
+		})
 	}
 }

@@ -486,8 +486,8 @@ var ErrApprovalPredatesLedger = errors.New("audit: approval predates the ledger'
 func (l *Log) Claim(planHash model.Digest, approvalIssuedAt time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if approvalIssuedAt.IsZero() || approvalIssuedAt.Before(l.notBefore) {
-		return fmt.Errorf("%w: issued at %s, NotBefore %s", ErrApprovalPredatesLedger, approvalIssuedAt.UTC(), l.notBefore)
+	if err := l.admitsLocked(approvalIssuedAt); err != nil {
+		return err
 	}
 	if l.claimed[planHash] {
 		return ErrAlreadyClaimed
@@ -506,13 +506,26 @@ func (l *Log) Claim(planHash model.Digest, approvalIssuedAt time.Time) error {
 func (l *Log) Guard(approvalIssuedAt time.Time, fn func() error) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if err := l.admitsLocked(approvalIssuedAt); err != nil {
+		return err
+	}
+	return fn()
+}
+
+// admitsLocked refuses a closed or never-opened log (a zero Log has no
+// NotBefore, which would admit every approval) and approvals issued
+// before NotBefore. l.mu must be held.
+func (l *Log) admitsLocked(approvalIssuedAt time.Time) error {
 	if l.closed {
 		return errors.New("audit: log is closed")
+	}
+	if l.f == nil || l.notBefore.IsZero() {
+		return ErrNotInitialized
 	}
 	if approvalIssuedAt.IsZero() || approvalIssuedAt.Before(l.notBefore) {
 		return fmt.Errorf("%w: issued at %s, NotBefore %s", ErrApprovalPredatesLedger, approvalIssuedAt.UTC(), l.notBefore)
 	}
-	return fn()
+	return nil
 }
 
 // Close releases the lock and closes the file.
