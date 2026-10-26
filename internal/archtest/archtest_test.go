@@ -220,7 +220,7 @@ func TestRepository(t *testing.T) {
 
 	// -deps also lists module packages imported from outside ./... (for
 	// example from an "_" or testdata directory). -export provides the
-	// export data CheckReflectTypes needs.
+	// export data CheckTypes needs.
 	pkgs := listExport(t, root)
 	if len(pkgs) == 0 {
 		t.Fatal("go list returned no packages")
@@ -260,7 +260,7 @@ func TestRepository(t *testing.T) {
 	}
 	violations = append(violations, wc...)
 	// Review 5 finding 1.
-	rt, err := CheckReflectTypes(module, pkgs)
+	rt, err := CheckTypes(module, pkgs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -599,7 +599,7 @@ func F(v any) ([]byte, error) { return json.Marshal(v) }`, false},
 				"p/p.go":      "package p\n\n" + c.body + "\n",
 				"p/p_test.go": "package p\n\nimport \"reflect\"\n\nvar _ reflect.Value\n",
 			})
-			got, err := CheckReflectTypes(m, listExport(t, root))
+			got, err := CheckTypes(m, listExport(t, root))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -666,5 +666,46 @@ func TestCheckForeignFiles(t *testing.T) {
 		if !found {
 			t.Errorf("%s not reported", rel)
 		}
+	}
+}
+
+// Review 5 finding 2: running another program (for example `go run` on
+// code outside the checks) escapes every boundary, so production code
+// may neither import os/exec nor reach the process-starting functions of
+// os and syscall, whether it calls them or only takes their value.
+func TestProcessStartForbidden(t *testing.T) {
+	if got := CheckBoundaries(mod, []Package{{ImportPath: mod + "/cmd/kodis", Imports: []string{"os/exec"}}}, Rules); len(got) != 1 {
+		t.Fatalf("os/exec import: %v", got)
+	}
+	const m = "example.test/ps"
+	cases := map[string]struct {
+		body string
+		want bool
+	}{
+		"os.StartProcess":       {`import "os"` + "\nfunc F() { _, _ = os.StartProcess(\"/bin/true\", nil, nil) }", true},
+		"os.StartProcess value": {`import "os"` + "\nvar F = os.StartProcess", true},
+		"syscall.Exec":          {`import "syscall"` + "\nfunc F() { _ = syscall.Exec(\"/bin/true\", nil, nil) }", true},
+		"syscall.ForkExec":      {`import "syscall"` + "\nvar F = syscall.ForkExec", true},
+		"syscall.StartProcess":  {`import "syscall"` + "\nvar F = syscall.StartProcess", true},
+		"raw syscall":           {`import "syscall"` + "\nfunc F() { syscall.Syscall(syscall.SYS_EXECVE, 0, 0, 0) }", true},
+		"raw syscall 6":         {`import "syscall"` + "\nvar F = syscall.RawSyscall6", true},
+		"aliased import":        {`import s "syscall"` + "\nvar F = s.Exec", true},
+		"flock is fine":         {`import "syscall"` + "\nfunc F(fd int) error { return syscall.Flock(fd, syscall.LOCK_EX) }", false},
+		"os file I/O is fine":   {`import "os"` + "\nfunc F() error { _, err := os.Open(\"x\"); return err }", false},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := writeFiles(t, map[string]string{
+				"go.mod": "module " + m + "\n\ngo 1.27.0\n",
+				"p/p.go": "package p\n\n" + c.body + "\n",
+			})
+			got, err := CheckTypes(m, listExport(t, root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(got) > 0) != c.want {
+				t.Fatalf("got %v, want violation %v", got, c.want)
+			}
+		})
 	}
 }

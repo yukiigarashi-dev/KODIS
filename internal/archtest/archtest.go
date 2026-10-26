@@ -58,6 +58,11 @@ var Rules = []Rule{
 		Reason:    "reflection, unsafe and call-by-name mechanisms (templates, rpc, plugins) can reach methods the static boundary checks cannot see",
 	},
 	{
+		Pkg:       "",
+		Forbidden: []string{"os/exec"},
+		Reason:    "a started program runs code the boundary checks never see (see also CheckTypes)",
+	},
+	{
 		Pkg:       "internal/execute",
 		Forbidden: []string{"internal/plan", "internal/evaluate", "internal/inspect", "internal/mockentra"},
 		Reason:    "executor must only consume model.Plan and model.Approval",
@@ -611,17 +616,21 @@ func CheckIgnoredDirs(root string, pkgs []Package) ([]string, error) {
 	return out, nil
 }
 
-// CheckReflectTypes type-checks the non-test files of every module package
-// and reports each expression or declared object whose type involves a
-// type from package reflect or unsafe.Pointer. Forbidding the imports is
-// not enough: some stdlib APIs hand out reflect values (for example
-// json.UnsupportedValueError.Value), and their methods (MethodByName,
-// Call) can then be used without ever naming reflect.
+// CheckTypes type-checks the non-test files of every module package and
+// reports:
+//   - each expression or declared object whose type involves a type from
+//     package reflect or unsafe.Pointer. Forbidding the imports is not
+//     enough: some stdlib APIs hand out reflect values (for example
+//     json.UnsupportedValueError.Value), and their methods (MethodByName,
+//     Call) can then be used without ever naming reflect;
+//   - each use of a function that starts a process or makes a raw system
+//     call (see startsProcess). syscall itself cannot be forbidden, since
+//     file locking and ownership checks need it.
 //
 // pkgs must come from `go list -export -deps`, so it covers the default
 // build configuration only; constrained files are limited by
 // ConstrainedAllowed and the import rules.
-func CheckReflectTypes(module string, pkgs []Package) ([]string, error) {
+func CheckTypes(module string, pkgs []Package) ([]string, error) {
 	export := map[string]string{}
 	for _, p := range pkgs {
 		if p.Export != "" {
@@ -677,6 +686,9 @@ func CheckReflectTypes(module string, pkgs []Package) ([]string, error) {
 		}
 		for id, obj := range info.Uses {
 			report(id.Pos(), obj.Type())
+			if startsProcess(obj) {
+				out = append(out, fmt.Sprintf("%s: %s.%s starts a process or makes a raw system call: the started code escapes the boundary checks", fset.Position(id.Pos()), obj.Pkg().Path(), obj.Name()))
+			}
 		}
 	}
 	if checked == 0 {
@@ -684,6 +696,27 @@ func CheckReflectTypes(module string, pkgs []Package) ([]string, error) {
 	}
 	out = slices.Compact(sortedStrings(out))
 	return out, nil
+}
+
+// startsProcess reports whether obj is os.StartProcess, a syscall
+// function that starts a process (Exec, ForkExec, StartProcess) or any
+// raw system call entry point (Syscall, RawSyscall, ...), through which
+// execve could be reached by number.
+func startsProcess(obj types.Object) bool {
+	if _, ok := obj.(*types.Func); !ok || obj.Pkg() == nil {
+		return false
+	}
+	switch obj.Pkg().Path() {
+	case "os":
+		return obj.Name() == "StartProcess"
+	case "syscall":
+		switch obj.Name() {
+		case "Exec", "ForkExec", "StartProcess":
+			return true
+		}
+		return strings.Contains(obj.Name(), "Syscall")
+	}
+	return false
 }
 
 func sortedStrings(s []string) []string {
