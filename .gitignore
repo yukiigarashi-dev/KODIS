@@ -1,0 +1,19 @@
+# Build output
+/kodis
+*.test
+*.out
+
+# Runtime artifacts (approver keys, audit logs): never commit them
+*.key
+*.pem
+approver.pub
+*.jsonl
+
+# Personal Claude Code settings (the shared .claude/settings.json is tracked)
+.claude/settings.local.json
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
