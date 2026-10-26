@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"go/ast"
 	"go/build/constraint"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -29,6 +32,8 @@ type Package struct {
 	Deps         []string
 	TestImports  []string
 	XTestImports []string
+	// Export is the compiled export data, set by `go list -export`.
+	Export string
 }
 
 // Rule forbids a module package (and its subpackages) from depending on the
@@ -604,4 +609,154 @@ func CheckIgnoredDirs(root string, pkgs []Package) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// CheckReflectTypes type-checks the non-test files of every module package
+// and reports each expression or declared object whose type involves a
+// type from package reflect or unsafe.Pointer. Forbidding the imports is
+// not enough: some stdlib APIs hand out reflect values (for example
+// json.UnsupportedValueError.Value), and their methods (MethodByName,
+// Call) can then be used without ever naming reflect.
+//
+// pkgs must come from `go list -export -deps`, so it covers the default
+// build configuration only; constrained files are limited by
+// ConstrainedAllowed and the import rules.
+func CheckReflectTypes(module string, pkgs []Package) ([]string, error) {
+	export := map[string]string{}
+	for _, p := range pkgs {
+		if p.Export != "" {
+			export[p.ImportPath] = p.Export
+		}
+	}
+	fset := token.NewFileSet()
+	imp := importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
+		f, ok := export[path]
+		if !ok {
+			return nil, fmt.Errorf("no export data for %s", path)
+		}
+		return os.Open(f)
+	})
+	var out []string
+	checked := 0
+	for _, p := range pkgs {
+		if p.Standard || !within(p.ImportPath, module) || len(p.GoFiles) == 0 {
+			continue
+		}
+		var files []*ast.File
+		for _, name := range p.GoFiles {
+			f, err := parser.ParseFile(fset, filepath.Join(p.Dir, name), nil, parser.SkipObjectResolution)
+			if err != nil {
+				return nil, err
+			}
+			files = append(files, f)
+		}
+		info := &types.Info{
+			Types: map[ast.Expr]types.TypeAndValue{},
+			Defs:  map[*ast.Ident]types.Object{},
+			Uses:  map[*ast.Ident]types.Object{},
+		}
+		conf := types.Config{Importer: imp}
+		if _, err := conf.Check(p.ImportPath, fset, files, info); err != nil {
+			return nil, fmt.Errorf("type-check %s: %w", p.ImportPath, err)
+		}
+		checked++
+		report := func(pos token.Pos, t types.Type) {
+			if involvesReflect(t, map[types.Type]bool{}) {
+				out = append(out, fmt.Sprintf("%s: value of type %s: reflection can reach methods the static boundary checks cannot see", fset.Position(pos), t))
+			}
+		}
+		for e, tv := range info.Types {
+			if tv.Type != nil {
+				report(e.Pos(), tv.Type)
+			}
+		}
+		for id, obj := range info.Defs {
+			if obj != nil {
+				report(id.Pos(), obj.Type())
+			}
+		}
+		for id, obj := range info.Uses {
+			report(id.Pos(), obj.Type())
+		}
+	}
+	if checked == 0 {
+		return nil, fmt.Errorf("no module packages of %s to type-check", module)
+	}
+	out = slices.Compact(sortedStrings(out))
+	return out, nil
+}
+
+func sortedStrings(s []string) []string {
+	sort.Strings(s)
+	return s
+}
+
+// involvesReflect reports whether t is, or is built from, a named type
+// declared in package reflect, or unsafe.Pointer. Named types from other
+// packages are not expanded (a struct holding a reflect.Value is fine
+// until its field is used, which is itself an expression of that type),
+// except for their type arguments.
+func involvesReflect(t types.Type, seen map[types.Type]bool) bool {
+	if t == nil || seen[t] {
+		return false
+	}
+	seen[t] = true
+	switch t := t.(type) {
+	case *types.Basic:
+		return t.Kind() == types.UnsafePointer
+	case *types.Alias:
+		return involvesReflect(types.Unalias(t), seen)
+	case *types.Named:
+		if obj := t.Obj(); obj.Pkg() != nil && (obj.Pkg().Path() == "reflect" || obj.Pkg().Path() == "unsafe") {
+			return true
+		}
+		for i := range t.TypeArgs().Len() {
+			if involvesReflect(t.TypeArgs().At(i), seen) {
+				return true
+			}
+		}
+		if t.Obj().Pkg() == nil {
+			return false
+		}
+		// Unnamed underlying structure of a named func or container type
+		// (e.g. ast.FieldFilter is func(string, reflect.Value) bool).
+		switch u := t.Underlying().(type) {
+		case *types.Signature, *types.Slice, *types.Array, *types.Map, *types.Chan, *types.Pointer:
+			return involvesReflect(u, seen)
+		}
+		return false
+	case *types.Pointer:
+		return involvesReflect(t.Elem(), seen)
+	case *types.Slice:
+		return involvesReflect(t.Elem(), seen)
+	case *types.Array:
+		return involvesReflect(t.Elem(), seen)
+	case *types.Map:
+		return involvesReflect(t.Key(), seen) || involvesReflect(t.Elem(), seen)
+	case *types.Chan:
+		return involvesReflect(t.Elem(), seen)
+	case *types.Signature:
+		if r := t.Recv(); r != nil && involvesReflect(r.Type(), seen) {
+			return true
+		}
+		return involvesReflect(t.Params(), seen) || involvesReflect(t.Results(), seen)
+	case *types.Tuple:
+		if t == nil {
+			return false
+		}
+		for i := range t.Len() {
+			if involvesReflect(t.At(i).Type(), seen) {
+				return true
+			}
+		}
+		return false
+	case *types.Struct:
+		for i := range t.NumFields() {
+			if involvesReflect(t.Field(i).Type(), seen) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }

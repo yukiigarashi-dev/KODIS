@@ -219,26 +219,9 @@ func TestRepository(t *testing.T) {
 	module := goOutput(t, "list", "-m")
 
 	// -deps also lists module packages imported from outside ./... (for
-	// example from an "_" or testdata directory).
-	cmd := exec.Command("go", "list", "-deps", "-json", "./...")
-	cmd.Dir = root
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	raw, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("go list: %v\n%s", err, stderr.String())
-	}
-	var pkgs []Package
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	for {
-		var p Package
-		if err := dec.Decode(&p); errors.Is(err, io.EOF) {
-			break
-		} else if err != nil {
-			t.Fatalf("decode go list output: %v", err)
-		}
-		pkgs = append(pkgs, p)
-	}
+	// example from an "_" or testdata directory). -export provides the
+	// export data CheckReflectTypes needs.
+	pkgs := listExport(t, root)
 	if len(pkgs) == 0 {
 		t.Fatal("go list returned no packages")
 	}
@@ -276,6 +259,12 @@ func TestRepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	violations = append(violations, wc...)
+	// Review 5 finding 1.
+	rt, err := CheckReflectTypes(module, pkgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations = append(violations, rt...)
 
 	// Review 2 finding 3: repeat the checks over every non-test source
 	// file, including ones the default build excludes, and allow build
@@ -544,5 +533,73 @@ func TestBuildConstraintDetection(t *testing.T) {
 	cf, err := CheckConstrainedFiles(root, src, []string{"a.go"}, oses, arches)
 	if err != nil || len(cf) != 1 || !strings.Contains(cf[0], "b.go") {
 		t.Fatalf("allowlist: %v %v", cf, err)
+	}
+}
+
+// listExport runs `go list -export -deps -json ./...` in dir.
+func listExport(t *testing.T, dir string) []Package {
+	t.Helper()
+	cmd := exec.Command("go", "list", "-export", "-deps", "-json", "./...")
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	raw, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list: %v\n%s", err, stderr.String())
+	}
+	var pkgs []Package
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	for {
+		var p Package
+		if err := dec.Decode(&p); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			t.Fatalf("decode go list output: %v", err)
+		}
+		pkgs = append(pkgs, p)
+	}
+	return pkgs
+}
+
+// Review 5 finding 1: a reflect.Value can be obtained from stdlib APIs
+// without importing reflect, e.g. json.UnsupportedValueError.Value, and
+// used to call methods by name. Any value of a reflect type (or
+// unsafe.Pointer) in module code is reported, however it was obtained.
+func TestCheckReflectTypes(t *testing.T) {
+	const m = "example.test/rt"
+	cases := map[string]struct {
+		body string
+		want bool
+	}{
+		"json error value": {`import ("encoding/json"; "errors")
+func F(err error) { var uv *json.UnsupportedValueError; if errors.As(err, &uv) { _ = uv.Value.MethodByName("Set") } }`, true},
+		"chained, never named": {`import "encoding/json"
+func F(uv *json.UnsupportedValueError) { uv.Value.MethodByName("Set").Call(nil) }`, true},
+		"testing/quick value": {`import ("math/rand"; "testing/quick")
+func F(r *rand.Rand) { v, _ := quick.Value(nil, r); _ = v }`, true},
+		"func value with reflect param": {`import "go/ast"
+var F = ast.NotNilFilter`, true},
+		"named func type with reflect param": {`import "go/ast"
+var F ast.FieldFilter`, true},
+		"json error message only": {`import ("encoding/json"; "errors")
+func F(err error) string { var uv *json.UnsupportedValueError; if errors.As(err, &uv) { return uv.Str }; return "" }`, false},
+		"plain json": {`import "encoding/json"
+func F(v any) ([]byte, error) { return json.Marshal(v) }`, false},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := writeFiles(t, map[string]string{
+				"go.mod":      "module " + m + "\n\ngo 1.27.0\n",
+				"p/p.go":      "package p\n\n" + c.body + "\n",
+				"p/p_test.go": "package p\n\nimport \"reflect\"\n\nvar _ reflect.Value\n",
+			})
+			got, err := CheckReflectTypes(m, listExport(t, root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(got) > 0) != c.want {
+				t.Fatalf("got %v, want violation %v", got, c.want)
+			}
+		})
 	}
 }
