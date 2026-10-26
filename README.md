@@ -58,7 +58,7 @@ Create an audit log for the tenant in the operator config. Logs are only ever cr
 ./kodis audit-init -config testdata/scenarios/baseline/config.json -audit ./audit.jsonl
 ```
 
-It prints a checkpoint such as `kodis-ckpt/v1:<log id>:1:<hash>`. **Keep it somewhere the audit log's writer cannot modify** (another account, append-only storage, paper). Every run requires the latest checkpoint and prints the next one.
+It prints a checkpoint such as `kodis-ckpt/v1:<log id>:1:<hash>`. **Keep it somewhere the audit log's writer cannot modify** (another account, append-only storage, paper). Every run requires a checkpoint and prints the next one. Always pass the latest one: KODIS accepts any checkpoint that matches the log, so it cannot tell an old checkpoint from the latest, and records written after the checkpoint you pass are not protected against removal.
 
 Run the pipeline against the simulated baseline tenant:
 
