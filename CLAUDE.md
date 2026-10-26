@@ -28,6 +28,7 @@ Key-scoped Operations & Deterministic Inspection System。
 - `entra.Writer` を参照してよいのは `internal/execute` と `internal/mockentra` だけ。
 - `internal/mockentra` を import してよいのは `cmd/kodis` だけ（テストを除く）。mock は `entra.Writer` を経由せずに書き込めるため。
 - `internal/policy` は I/O を持たない（os, net, net/http, os/exec, io/fs, syscall を import しない）。
+- モジュール内のどのパッケージも、`reflect`・`unsafe`・`text/template`・`html/template`・`net/rpc`・`plugin`（サブパッケージを含む）を import しない。メソッドを文字列の名前で呼べるため、静的な境界の検査をすり抜ける。
 - 境界は `internal/archtest` が強制する。ルールを緩める変更は、ユーザーの明示的な承認なしに行わない。
 
 ## 開発コマンド

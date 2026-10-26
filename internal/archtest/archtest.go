@@ -30,7 +30,8 @@ type Package struct {
 }
 
 // Rule forbids a module package (and its subpackages) from depending on the
-// listed paths. Module-relative paths (starting with "internal/" or "cmd/")
+// listed paths. An empty Pkg means every package of the module, including
+// its root. Module-relative paths (starting with "internal/" or "cmd/")
 // are checked against transitive deps; stdlib paths are checked against
 // direct imports only, because common stdlib packages pull in os etc.
 type Rule struct {
@@ -43,14 +44,11 @@ type Rule struct {
 // explicit human approval.
 var Rules = []Rule{
 	{
-		Pkg:       "internal",
-		Forbidden: []string{"reflect", "unsafe"},
-		Reason:    "reflection and unsafe can reach methods the static boundary checks cannot see",
-	},
-	{
-		Pkg:       "cmd",
-		Forbidden: []string{"reflect", "unsafe"},
-		Reason:    "reflection and unsafe can reach methods the static boundary checks cannot see",
+		// Every module package, wherever it lives: a package outside
+		// internal/ and cmd/ can still be imported by them.
+		Pkg:       "",
+		Forbidden: []string{"reflect", "unsafe", "text/template", "html/template", "net/rpc", "plugin"},
+		Reason:    "reflection, unsafe and call-by-name mechanisms (templates, rpc, plugins) can reach methods the static boundary checks cannot see",
 	},
 	{
 		Pkg:       "internal/execute",
@@ -165,7 +163,11 @@ func CheckBoundaries(module string, pkgs []Package, rules []Rule) []string {
 	var out []string
 	for _, p := range pkgs {
 		for _, r := range rules {
-			if !within(p.ImportPath, module+"/"+r.Pkg) {
+			scope := module
+			if r.Pkg != "" {
+				scope = module + "/" + r.Pkg
+			}
+			if p.Standard || !within(p.ImportPath, scope) {
 				continue
 			}
 			// Report each offending dependency once per rule, even if it

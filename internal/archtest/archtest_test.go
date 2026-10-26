@@ -176,13 +176,28 @@ func TestCheckWriteCalls(t *testing.T) {
 	}
 }
 
-func TestReflectAndUnsafeForbidden(t *testing.T) {
-	for _, imp := range []string{"reflect", "unsafe"} {
-		for _, pkg := range []string{"internal/verify", "cmd/kodis"} {
-			got := CheckBoundaries(mod, []Package{{ImportPath: mod + "/" + pkg, Imports: []string{imp}}}, Rules)
+// Review 4 finding 1: reflection and other call-by-name mechanisms are
+// forbidden in every module package, not only under internal/ and cmd/.
+// text/template, html/template and net/rpc call methods named in strings,
+// which CheckWriteCalls cannot see.
+func TestCallByNameForbiddenEverywhere(t *testing.T) {
+	// Subpackages are covered too (fail closed, e.g. text/template/parse).
+	for _, imp := range []string{"reflect", "unsafe", "text/template", "text/template/parse", "html/template", "net/rpc", "net/rpc/jsonrpc", "plugin"} {
+		for _, pkg := range []string{"", "/bridge", "/_bridge", "/internal/verify", "/internal/execute", "/cmd/kodis"} {
+			got := CheckBoundaries(mod, []Package{{ImportPath: mod + pkg, Imports: []string{imp}}}, Rules)
 			if len(got) != 1 {
-				t.Errorf("%s importing %s: got %v", pkg, imp, got)
+				t.Errorf("%q importing %s: got %v, want 1 violation", mod+pkg, imp, got)
 			}
+		}
+	}
+	for name, p := range map[string]Package{
+		"stdlib package using reflect": {ImportPath: "encoding/json", Standard: true, Imports: []string{"reflect"}},
+		"package outside the module":   {ImportPath: "example.test/other", Imports: []string{"reflect"}},
+		"module prefix is not module":  {ImportPath: mod + "x/bridge", Imports: []string{"reflect"}},
+		"only transitive via stdlib":   {ImportPath: mod + "/bridge", Imports: []string{"encoding/json"}, Deps: []string{"encoding/json", "reflect"}},
+	} {
+		if got := CheckBoundaries(mod, []Package{p}, Rules); len(got) != 0 {
+			t.Errorf("%s: got %v, want none", name, got)
 		}
 	}
 }
