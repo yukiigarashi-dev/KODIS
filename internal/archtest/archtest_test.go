@@ -299,6 +299,12 @@ func TestRepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	violations = append(violations, ig...)
+	// Review 5 finding 2.
+	ff, err := CheckForeignFiles(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations = append(violations, ff...)
 	for _, v := range violations {
 		t.Error(v)
 	}
@@ -601,5 +607,64 @@ func F(v any) ([]byte, error) { return json.Marshal(v) }`, false},
 				t.Fatalf("got %v, want violation %v", got, c.want)
 			}
 		})
+	}
+}
+
+// Review 5 finding 2: a nested module is invisible to every package-based
+// check, and non-Go sources (assembly, C, .syso objects) that go build
+// links into a package are invisible to the Go parsers. Both are refused.
+func TestCheckForeignFiles(t *testing.T) {
+	bad := map[string]string{
+		"nested/go.mod":        "module example.test/kodis/nested\n",
+		"go.work":              "go 1.27.0\n",
+		"deep/x/go.work":       "go 1.27.0\n",
+		"internal/execute/a.s": "TEXT ·f(SB),0,$0\n",
+		"internal/plan/b.S":    "",
+		"cmd/kodis/c.c":        "",
+		"cmd/kodis/d.h":        "",
+		"internal/x/e.syso":    "",
+		"internal/x/f.cc":      "",
+		"internal/x/g.cpp":     "",
+		"internal/x/h.cxx":     "",
+		"internal/x/i.hpp":     "",
+		"internal/x/j.m":       "",
+		"internal/x/k.f90":     "",
+		"internal/x/l.swig":    "",
+		".hidden/m.s":          "",
+	}
+	ok := map[string]string{
+		"go.mod":                  "module " + mod + "\n",
+		"README.md":               "",
+		"internal/x/x.go":         "package x\n",
+		"testdata/a.json":         "{}",
+		"scripts/safe-test.sh":    "",
+		"internal/x/notes.sx.txt": "",
+		".git/objects/pack/z.s":   "", // git's own directory is not source
+	}
+	all := map[string]string{}
+	for k, v := range bad {
+		all[k] = v
+	}
+	for k, v := range ok {
+		all[k] = v
+	}
+	root := writeFiles(t, all)
+	got, err := CheckForeignFiles(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(bad) {
+		t.Fatalf("got %d violations, want %d:\n%s", len(got), len(bad), strings.Join(got, "\n"))
+	}
+	for rel := range bad {
+		found := false
+		for _, v := range got {
+			if strings.HasPrefix(v, rel+":") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s not reported", rel)
+		}
 	}
 }

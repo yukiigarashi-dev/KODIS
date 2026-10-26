@@ -760,3 +760,51 @@ func involvesReflect(t types.Type, seen map[types.Type]bool) bool {
 	}
 	return false
 }
+
+// foreignExts are the non-Go source and object files go build compiles or
+// links into a package (cgo, assembly, SWIG, .syso). The Go parsers used
+// by these checks cannot see what they call.
+var foreignExts = []string{
+	".s", ".S", ".sx", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+	".m", ".f", ".F", ".for", ".f90", ".swig", ".swigcxx", ".syso",
+}
+
+// CheckForeignFiles walks root and reports nested go.mod files and any
+// go.work (a nested module or workspace escapes every package-based check
+// of this module), and files go build would compile or link from other
+// languages. Only root's .git directory is skipped: git does not track
+// files inside it.
+func CheckForeignFiles(root string) ([]string, error) {
+	var out []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			if rel == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		switch {
+		case name == "go.mod" && rel != "go.mod":
+			out = append(out, rel+": nested module; its code escapes the checks of this module")
+		case name == "go.work":
+			out = append(out, rel+": workspace files are not allowed")
+		case slices.Contains(foreignExts, filepath.Ext(name)):
+			out = append(out, rel+": non-Go source compiled or linked by go build")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(out)
+	return out, nil
+}
