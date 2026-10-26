@@ -28,8 +28,11 @@ Key-scoped Operations & Deterministic Inspection System。
 - `entra.Writer` を参照してよいのは `internal/execute` と `internal/mockentra` だけ。
 - `internal/mockentra` を import してよいのは `cmd/kodis` だけ（テストを除く）。mock は `entra.Writer` を経由せずに書き込めるため。
 - `internal/policy` は I/O を持たない（os, net, net/http, os/exec, io/fs, syscall を import しない）。
-- モジュール内のどのパッケージも、`reflect`・`unsafe`・`text/template`・`html/template`・`net/rpc`・`plugin`（サブパッケージを含む）を import しない。メソッドを文字列の名前で呼べるため、静的な境界の検査をすり抜ける。
+- モジュール内のどのパッケージも、`reflect`・`unsafe`・`text/template`・`html/template`・`net/rpc`・`plugin`（サブパッケージを含む）を import しない。メソッドを文字列の名前で呼べるため、静的な境界の検査をすり抜ける。import しなくても、reflect の型や `unsafe.Pointer` を持つ値を扱わない（型検査で検出する）。
+- 本番コードからプロセスを起動しない（`os/exec`、`os.StartProcess`、`syscall` の Exec・ForkExec・StartProcess・Syscall 系）。起動した先のコードは検査できないため。
+- 入れ子の go.mod、go.work、Go 以外のソース（`.s`・`.c`・`.syso` など）を置かない。本番コードを `./...` が無視するディレクトリ（`.` や `_` で始まるもの、testdata、vendor）に置かない。
 - 境界は `internal/archtest` が強制する。ルールを緩める変更は、ユーザーの明示的な承認なしに行わない。
+- archtest が守る範囲: 不注意による変更や、LLM が生成したコードを人間がレビューする場合の境界違反を検出し、意図的な迂回には目立つ書き方が必要になる状態を保つ。リポジトリに書き込める者が**意図的に**迂回するコミットは対象外で、コードレビュー・ブランチ保護・CODEOWNERS で防ぐ。対象外の迂回を archtest の強化で塞ぎ続けることはしない。
 
 ## 開発コマンド
 環境変数 `GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly` を前提にする（.claude/settings.json で設定済み）。

@@ -29,7 +29,7 @@ The rules below are enforced in code and by tests (see [CLAUDE.md](CLAUDE.md) fo
 - **Approvals are bound to one plan hash.** The hash covers the plan's canonical encoding, so any change to its content invalidates the approval.
 - **Independent verification.** `internal/verify` never uses executor results; it reads the tenant again.
 - **Single-use, auditable execution.** Each plan is claimed once in the audit log; the log is created explicitly, scoped to one tenant, and checked against an externally kept checkpoint on every run.
-- **Package boundaries are tested.** `internal/archtest` fails the test suite if, for example, anything other than the executor calls a tenant write, or the policy engine imports I/O packages.
+- **Package boundaries are tested.** `internal/archtest` fails the test suite if, for example, anything other than the executor calls a tenant write, the policy engine imports I/O packages, or any package uses reflection or starts a process. It is meant to catch accidental violations and keep deliberate bypasses conspicuous; it does not stop a committer who sets out to bypass it, which is left to code review.
 - **Go standard library only.** `go.mod` has no `require`; no npm or other dependencies.
 
 ## Requirements
